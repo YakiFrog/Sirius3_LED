@@ -1077,6 +1077,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
+        # 初期化属性の追加
+        self.auto_mode = False  # 自動モードフラグの初期化
+        self.current_color = QColor(255, 255, 255)  # 現在の色を白で初期化
+        self.current_hue = 0  # 現在の色相を初期化
+        
         self.audio_mode = False
         
         # オーディオプロセッサの初期化
@@ -1844,11 +1849,10 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def update_audio_interval(self, value):
-        """音声連動更新間隔の設定を更新"""
+        """音声連動モードの更新間隔を更新"""
         self.audio_interval_label.setText(f"{value} ms")
         if hasattr(self, 'audio_processor'):
             self.audio_processor.update_interval = value
-            self.logger.info(f"音声連動更新間隔を {value} msに設定しました")
 
     def update_audio_transition_time(self, value):
         """音声連動モードの遷移時間を更新"""
