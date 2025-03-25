@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>Sirius3 LED Controller</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.nlab.sirius3ledcontroller</string>
+    <key>CFBundleName</key>
+    <string>Sirius3 LED Controller</string>
+    <key>CFBundleVersion</key>
+    <string>1.0.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>このアプリはSirius3 LEDデバイスに接続してコントロールするためにBluetoothを使用します。</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>このアプリはSirius3 LEDデバイスに接続してコントロールするためにBluetoothを使用します。</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>このアプリは音楽連動モードで音声をキャプチャするためにマイクを使用します。</string>
+</dict>
+</plist>
