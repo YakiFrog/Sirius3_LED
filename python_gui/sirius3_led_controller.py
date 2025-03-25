@@ -274,6 +274,7 @@ class BLEController(QObject):
         # オーディオ連動モード
         self.audio_mode = False
         self.audio_timer = None
+        self.audio_transition_time = 200  # オーディオ遷移時間のデフォルト値(ms)
     
     def start_queue_processor(self):
         """コマンドキュー処理スレッドを開始"""
@@ -599,6 +600,9 @@ class BLEController(QObject):
                 if cmd_type == CMD_COLOR:
                     r, g, b = value
                     command_str = f"{cmd_type}:{r},{g},{b}"
+                elif cmd_type == CMD_TRANSITION:
+                    r, g, b, duration = value
+                    command_str = f"{cmd_type}:{r},{g},{b},{duration}"
                 else:
                     command_str = f"{cmd_type}:{value}"
                 
@@ -727,6 +731,11 @@ class BLEController(QObject):
         else:
             self._log(logging.INFO, "オーディオ連動モードを停止しました")
     
+    def set_audio_transition_time(self, ms):
+        """オーディオ連動モードの遷移時間設定"""
+        self.audio_transition_time = ms
+        self._log(logging.INFO, f"オーディオ連動モードの遷移時間を {ms} msに設定しました")
+    
     def update_audio_color(self, color):
         """オーディオ処理からの色更新"""
         if not self.audio_mode:
@@ -741,12 +750,12 @@ class BLEController(QObject):
         if not connected_devices:
             return
             
-        # 全デバイスに同時に色を送信
+        # 全デバイスに同時に色を送信（遷移コマンドを使用）
         commands = []
         r, g, b = color.red(), color.green(), color.blue()
         
         for device_key in connected_devices:
-            commands.append((device_key, CMD_COLOR, (r, g, b)))
+            commands.append((device_key, CMD_TRANSITION, (r, g, b, self.audio_transition_time)))
         
         # コールバックなしで送信（軽量処理）
         self._send_commands_simultaneously(commands)
@@ -1068,9 +1077,6 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        self.current_color = QColor(255, 255, 255)
-        self.current_hue = 0
-        self.auto_mode = False
         self.audio_mode = False
         
         # オーディオプロセッサの初期化
@@ -1216,12 +1222,24 @@ class MainWindow(QMainWindow):
         audio_settings_layout.addWidget(QLabel("音声連動更新間隔:"))
         self.audio_interval_slider = QSlider(Qt.Horizontal)
         self.audio_interval_slider.setRange(100, 500)  # 0.1秒から0.5秒
-        self.audio_interval_slider.setValue(150)  # デフォルト0.15秒
+        self.audio_interval_slider.setValue(150)  # デフォルト0.2秒
         self.audio_interval_slider.valueChanged.connect(self.update_audio_interval)
         audio_settings_layout.addWidget(self.audio_interval_slider)
         self.audio_interval_label = QLabel("150 ms")
         audio_settings_layout.addWidget(self.audio_interval_label)
         color_layout.addLayout(audio_settings_layout)
+        
+        # 音声連動遷移時間設定を追加
+        audio_transition_layout = QHBoxLayout()
+        audio_transition_layout.addWidget(QLabel("音声連動遷移時間:"))
+        self.audio_transition_slider = QSlider(Qt.Horizontal)
+        self.audio_transition_slider.setRange(50, 300)  # 50msから300ms
+        self.audio_transition_slider.setValue(200)  # デフォルト200ms
+        self.audio_transition_slider.valueChanged.connect(self.update_audio_transition_time)
+        audio_transition_layout.addWidget(self.audio_transition_slider)
+        self.audio_transition_label = QLabel("200 ms")
+        audio_transition_layout.addWidget(self.audio_transition_label)
+        color_layout.addLayout(audio_transition_layout)
         
         # 自動モードのチェックボックスは非表示にする（ラジオボタンに置き換え）
         self.auto_mode_check = QCheckBox("自動色相変化モード")
@@ -1533,6 +1551,9 @@ class MainWindow(QMainWindow):
                 return
                 
             self.ble_controller.set_audio_mode(True)
+            
+            # 現在設定されている遷移時間を適用
+            self.ble_controller.set_audio_transition_time(self.audio_transition_slider.value())
         
         # 現在選択されているモードをログに出力
         mode_name = "固定色" if self.fixed_mode_radio.isChecked() else \
@@ -1829,6 +1850,12 @@ class MainWindow(QMainWindow):
             self.audio_processor.update_interval = value
             self.logger.info(f"音声連動更新間隔を {value} msに設定しました")
 
+    def update_audio_transition_time(self, value):
+        """音声連動モードの遷移時間を更新"""
+        self.audio_transition_label.setText(f"{value} ms")
+        if hasattr(self, 'ble_controller'):
+            self.ble_controller.set_audio_transition_time(value)
+    
     def update_transition_time_label(self, value):
         """遷移時間ラベルを更新"""
         self.transition_time_label.setText(f"{value} ms")

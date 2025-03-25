@@ -6,7 +6,7 @@
 #include <BLE2902.h>
 
 // 各基板で変更するデバイスID（基板1には1、基板2には2を設定）
-#define DEVICE_ID 1
+#define DEVICE_ID 2
 
 // デバイス固有の設定
 #if DEVICE_ID == 1
