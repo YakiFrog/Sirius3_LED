@@ -50,7 +50,7 @@ class QTextEditLogger(logging.Handler):
         # エラーメッセージの色を設定
         self.level_colors = {
             logging.DEBUG: "gray",
-            logging.INFO: "black",
+            logging.INFO: "white",
             logging.WARNING: "orange",
             logging.ERROR: "red",
             logging.CRITICAL: "darkred"
@@ -58,7 +58,7 @@ class QTextEditLogger(logging.Handler):
     
     def emit(self, record):
         msg = self.format(record)
-        color = self.level_colors.get(record.levelno, "black")
+        color = self.level_colors.get(record.levelno, "white")
         
         # メインスレッドからの呼び出しを保証
         self.widget.textCursor().insertHtml(
@@ -922,7 +922,7 @@ class MainWindow(QMainWindow):
     def show_color_picker(self):
         """カラーピッカーダイアログを表示"""
         color = QColorDialog.getColor(self.current_color, self, "色を選択")
-        if color.isValid():
+        if (color.isValid()):
             self.current_color = color
             self.color_preview.setColor(color)
             self.auto_mode_check.setChecked(False)  # 色を選択したら自動モードをオフ
