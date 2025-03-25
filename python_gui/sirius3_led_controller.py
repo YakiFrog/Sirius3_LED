@@ -763,23 +763,51 @@ class AudioProcessor(QObject):
         self.lock = Lock()
         
         # FFT解析用のバッファ
-        self.fft_buffer = deque(maxlen=5)  # 過去5フレームのFFT結果を保持
+        self.fft_buffer = deque(maxlen=8)  # バッファサイズを増やす
         
         # パラメータ設定を調整
-        self.sensitivity = 0.5     # 感度を少し下げる（0.7→0.5）
-        self.smoothing = 0.6      # スムージングを強める（0.3→0.6）
-        self.bass_boost = 1.1     # 低音の強調を抑える（1.3→1.1）
+        self.sensitivity = 0.65      # 感度を上げる
+        self.smoothing = 0.85       # スムージングをより強く
+        self.bass_boost = 1.2       # 低音の強調を調整
+        self.treble_boost = 1.1     # 高音の強調を調整
         
-        # 色変化用の追加パラメータ
-        self.color_smoothing = 0.8  # 色の変化をより滑らかに
-        self.saturation_min = 0.5   # 最小彩度
-        self.value_min = 0.3        # 最小明度
+        # 色変化用のパラメータ調整
+        self.color_smoothing = 0.82  # 色の変化をより滑らかに
+        self.saturation_min = 0.6    # 最小彩度を上げる（より鮮やか）
+        self.value_min = 0.5         # 最小明度を上げる（より明るく）
+        self.value_boost = 1.4       # 明度のブースト係数を上げる
+        
+        # FFTバッファサイズを増やして安定化
+        self.fft_buffer = deque(maxlen=12)  # バッファサイズを増やす
+        
+        # 色相範囲の設定（0-1の範囲）
+        self.hue_range = (0.0, 1.0)  # 全色相を使用
+        
+        # 移動平均用のバッファサイズを増やす
+        self.hue_buffer_size = 8
+        self.value_buffer_size = 8
+        
+        # バンドごとの重み付け調整
+        self.band_weights = {
+            "sub_bass": 1.8,   # サブベース
+            "bass": 1.5,       # ベース
+            "low_mid": 1.2,    # 低中音
+            "mid": 1.0,        # 中音
+            "high_mid": 1.3,   # 高中音
+            "high": 1.4        # 高音
+        }
         
         # 前回の色とレベル値（スムージング用）
         self.prev_hue = 0.0
         self.prev_saturation = 0.0
         self.prev_value = 0.0
         self.prev_level = 0.0
+        
+        # パワー計算用の指数
+        self.power_scale = 1.5     # パワースペクトルのスケーリング係数
+        
+        # 色相範囲の制限（0-1の範囲で）
+        self.hue_range = (0.0, 0.85)  # 赤から紫までの範囲
     
     def start(self):
         """オーディオ処理を開始"""
@@ -860,13 +888,19 @@ class AudioProcessor(QObject):
     def _processing_thread(self):
         """オーディオデータを処理するスレッド"""
         
-        # 周波数バンドの定義を調整（より細かく）
+        # 周波数バンドの定義をさらに詳細に
         bands = {
-            "low": (20, 200),      # 低音域
-            "mid_low": (200, 800),  # 中低音域
-            "mid": (800, 2500),     # 中音域
-            "high": (2500, 12000)   # 高音域
+            "sub_bass": (20, 60),    # サブベース
+            "bass": (60, 250),       # ベース
+            "low_mid": (250, 500),   # 低中音
+            "mid": (500, 2000),      # 中音
+            "high_mid": (2000, 4000),# 高中音
+            "high": (4000, 12000)    # 高音
         }
+        
+        # 移動平均用のバッファ
+        hue_buffer = deque([0.0] * 5, maxlen=5)
+        value_buffer = deque([0.0] * 5, maxlen=5)
         
         while self.running:
             try:
@@ -893,7 +927,7 @@ class AudioProcessor(QObject):
                 # 周波数ビンのインデックス計算
                 freq_bins = np.fft.rfftfreq(len(samples), 1.0/self.RATE)
                 
-                # 各周波数帯の強度を計算
+                # 各周波数帯の強度を計算（よりスムーズに）
                 band_levels = {}
                 for band_name, (low_freq, high_freq) in bands.items():
                     # 該当する周波数範囲のインデックスを取得
@@ -901,66 +935,63 @@ class AudioProcessor(QObject):
                     
                     # この帯域の平均振幅を計算
                     if len(band_indices) > 0:
-                        band_amplitude = np.mean(fft_data[band_indices])
+                        # パワースペクトルの計算を改善
+                        band_power = np.mean(np.power(fft_data[band_indices], self.power_scale))
                         
-                        # 低音域を強調（オプション）
-                        if band_name == "low":
-                            band_amplitude *= self.bass_boost
+                        # 重み付けとブースト処理
+                        weight = self.band_weights.get(band_name, 1.0)
+                        if band_name in ["sub_bass", "bass"]:
+                            band_power *= self.bass_boost
+                        elif band_name in ["high_mid", "high"]:
+                            band_power *= self.treble_boost
                             
-                        band_levels[band_name] = band_amplitude
+                        band_levels[band_name] = band_power * weight
                     else:
                         band_levels[band_name] = 0.0
                 
-                # オーディオレベルの計算（全体の強度）
-                overall_level = np.mean([
-                    band_levels["low"],
-                    band_levels["mid_low"],
-                    band_levels["mid"], 
-                    band_levels["high"]
-                ])
+                # 低音と高音のバランスで色相を計算
+                bass_energy = (band_levels["sub_bass"] * 2.0 + band_levels["bass"]) / 3.0
+                treble_energy = (band_levels["high_mid"] + band_levels["high"]) / 2.0
                 
-                # 大きな値が出る可能性があるのでクリップ
-                overall_level = min(1.0, overall_level * self.sensitivity * 5.0)
+                # 色相の計算
+                target_hue = 0.0
+                if bass_energy > 0 or treble_energy > 0:
+                    # より自然な色相の変化
+                    total_energy = bass_energy + treble_energy
+                    if total_energy > 0:
+                        balance = bass_energy / total_energy
+                        # 色相範囲のマッピング (低音が強いほど赤系、高音が強いほど青系)
+                        hue_min, hue_max = self.hue_range
+                        target_hue = hue_min + (hue_max - hue_min) * (1.0 - balance)
                 
-                # スムージング処理
-                smoothed_level = (overall_level * (1.0 - self.smoothing) + 
-                                  self.prev_level * self.smoothing)
-                self.prev_level = smoothed_level
+                # 色相の移動平均を計算
+                hue_buffer.append(target_hue)
+                smoothed_hue = np.mean(hue_buffer)
                 
-                # 色相計算を改善（より広い色範囲を使用）
-                if band_levels["low"] > 0 and band_levels["high"] > 0:
-                    # 低音と高音のバランスで色相を決定（全色相範囲を使用）
-                    low_intensity = band_levels["low"] * 2.0
-                    high_intensity = band_levels["high"]
-                    balance = low_intensity / (low_intensity + high_intensity)
-                    target_hue = balance  # 0.0-1.0の全範囲を使用
-                else:
-                    target_hue = self.prev_hue
-
                 # 中音のエネルギーで彩度を決定
-                mid_energy = (band_levels["mid_low"] + band_levels["mid"]) * 0.5
+                mid_energy = (band_levels["low_mid"] + band_levels["mid"] + band_levels["high_mid"]) / 3.0
                 target_saturation = max(
                     self.saturation_min,
-                    min(1.0, mid_energy * 3.0 * self.sensitivity)
+                    min(1.0, mid_energy * 2.0 * self.sensitivity)
                 )
                 
-                # 全体の強度で明度を決定（より滑らかな変化）
+                # 全体的な強度で明度を決定
                 overall_level = np.mean([
-                    band_levels["low"] * 1.2,
-                    band_levels["mid_low"],
-                    band_levels["mid"],
-                    band_levels["high"] * 0.8
+                    band_levels[band] for band in bands.keys()
                 ])
-                
-                target_value = max(
+                base_value = max(
                     self.value_min,
-                    min(1.0, overall_level * 2.0 * self.sensitivity + 0.3)
+                    min(1.0, overall_level * self.sensitivity * self.value_boost)
                 )
                 
-                # より強いスムージング処理
-                hue = target_hue * (1.0 - self.color_smoothing) + self.prev_hue * self.color_smoothing
+                # 明度の移動平均を計算
+                value_buffer.append(base_value)
+                smoothed_value = np.mean(value_buffer)
+                
+                # さらに強いスムージング処理
+                hue = smoothed_hue * (1.0 - self.color_smoothing) + self.prev_hue * self.color_smoothing
                 saturation = target_saturation * (1.0 - self.color_smoothing) + self.prev_saturation * self.color_smoothing
-                value = target_value * (1.0 - self.color_smoothing) + self.prev_value * self.color_smoothing
+                value = smoothed_value * (1.0 - self.smoothing) + self.prev_value * self.smoothing
                 
                 # 前回の値を更新
                 self.prev_hue = hue
@@ -979,10 +1010,10 @@ class AudioProcessor(QObject):
                 
                 # 信号発信
                 self.color_changed.emit(color)
-                self.audio_level.emit(smoothed_level)
+                self.audio_level.emit(smoothed_value)
                 
-                # フレームレートを少し下げて安定化
-                time.sleep(0.04)  # 約25FPS
+                # フレームレートを調整
+                time.sleep(0.04)  # 25FPSに制限してより安定した表示に
                 
             except Exception as e:
                 logging.error(f"オーディオ処理中にエラー: {str(e)}")
