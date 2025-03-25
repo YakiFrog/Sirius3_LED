@@ -7,6 +7,11 @@ import concurrent.futures
 from threading import Thread, Lock, Event
 from functools import partial
 from datetime import datetime
+import numpy as np
+import pyaudio
+import struct
+import colorsys
+from collections import deque
 
 from bleak import BleakScanner, BleakClient
 from bleak.exc import BleakError, BleakDeviceNotFoundError
@@ -14,7 +19,8 @@ from bleak.exc import BleakError, BleakDeviceNotFoundError
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                               QHBoxLayout, QPushButton, QLabel, QSlider, QComboBox,
                               QGroupBox, QCheckBox, QColorDialog, QMessageBox,
-                              QTextEdit, QSplitter, QProgressBar)
+                              QTextEdit, QSplitter, QProgressBar, QRadioButton,
+                              QButtonGroup)
 from PySide6.QtCore import Qt, Signal, Slot, QObject, QTimer, QSize
 from PySide6.QtGui import QColor, QPainter, QBrush, QTextCursor, QFont
 
@@ -236,7 +242,11 @@ class BLEController(QObject):
         self.command_timeout = 5.0  
         
         # コマンド送信間隔（秒）
-        self.command_interval = 0.1  
+        self.command_interval = 0.1
+
+        # オーディオ連動モード
+        self.audio_mode = False
+        self.audio_timer = None
     
     def start_queue_processor(self):
         """コマンドキュー処理スレッドを開始"""
@@ -275,6 +285,12 @@ class BLEController(QObject):
                     self._log(logging.WARNING, f"{device_key}デバイスは接続されていません。コマンドをスキップします: {command}")
                     if command.callback:
                         command.callback(False)
+                    self.command_queue.task_done()
+                    continue
+                
+                # コマンドの処理
+                if self.audio_mode and command.cmd_type == CMD_COLOR:
+                    # オーディオ連動モードの場合、色設定コマンドは無視
                     self.command_queue.task_done()
                     continue
                 
@@ -618,6 +634,92 @@ class BLEController(QObject):
         if hasattr(self, 'io_thread'):
             self.io_thread.stop()
 
+    def check_connection(self, device_key):
+        """デバイスの接続状態をチェック"""
+        future = concurrent.futures.Future()
+        
+        with self.lock:
+            client = self.clients.get(device_key)
+            if not client:
+                self._log(logging.DEBUG, f"{device_key}デバイスのクライアントが存在しません")
+                self._update_connection_status(device_key, False)
+                future.set_result(False)
+                return future
+        
+        # 接続状態確認処理
+        async def check_connection_async():
+            try:
+                if client.is_connected:
+                    # services プロパティを使用して警告を回避
+                    services = client.services
+                    if services:
+                        return True
+                return False
+            except Exception as e:
+                self._log(logging.DEBUG, f"{device_key}デバイス接続確認中にエラー: {str(e)}")
+                return False
+        
+        # IO専用スレッドで実行
+        io_future = self.io_thread.execute(check_connection_async())
+        
+        # 完了コールバック
+        def on_done(f):
+            try:
+                result = f.result()
+                # 接続状態を更新
+                self._update_connection_status(device_key, result)
+                future.set_result(result)
+            except Exception as e:
+                self._log(logging.ERROR, f"{device_key}デバイスの接続確認でエラー: {str(e)}")
+                self._update_connection_status(device_key, False)
+                future.set_exception(e)
+        
+        io_future.add_done_callback(on_done)
+        return future
+    
+    def check_all_connections(self):
+        """全デバイスの接続状態をチェック"""
+        futures = []
+        for device_key in ["LEFT", "RIGHT"]:
+            if self.clients.get(device_key):
+                futures.append(self.check_connection(device_key))
+        
+        return futures
+    
+    def set_audio_mode(self, enabled):
+        """オーディオ連動モードの設定"""
+        self.audio_mode = enabled
+        
+        # オーディオ連動タイマーの制御
+        if self.audio_mode:
+            self._log(logging.INFO, "オーディオ連動モードを開始しました")
+        else:
+            self._log(logging.INFO, "オーディオ連動モードを停止しました")
+    
+    def update_audio_color(self, color):
+        """オーディオ処理からの色更新"""
+        if not self.audio_mode:
+            return
+            
+        # 接続済みのデバイスを確認
+        connected_devices = []
+        for device_key in ["LEFT", "RIGHT"]:
+            if self.connected.get(device_key, False):
+                connected_devices.append(device_key)
+        
+        if not connected_devices:
+            return
+            
+        # 全デバイスに同時に色を送信
+        commands = []
+        r, g, b = color.red(), color.green(), color.blue()
+        
+        for device_key in connected_devices:
+            commands.append((device_key, CMD_COLOR, (r, g, b)))
+        
+        # コールバックなしで送信（軽量処理）
+        self._send_commands_simultaneously(commands)
+
 class ColorPreviewWidget(QWidget):
     """色のプレビューを表示するウィジェット"""
     def __init__(self, parent=None):
@@ -634,6 +736,265 @@ class ColorPreviewWidget(QWidget):
         painter.setBrush(QBrush(self.color))
         painter.drawRect(0, 0, self.width(), self.height())
 
+class AudioProcessor(QObject):
+    """音声信号を処理してLED色情報に変換するクラス"""
+    
+    # 色更新シグナル
+    color_changed = Signal(QColor)
+    audio_level = Signal(float)  # 0.0-1.0 のレベル
+    
+    def __init__(self):
+        super().__init__()
+        
+        # ロガーの設定
+        self.logger = logging.getLogger("sirius3.audio")
+        
+        # PyAudioの設定
+        self.p = pyaudio.PyAudio()
+        self.CHUNK = 1024  # 一度に読み取るサンプル数
+        self.FORMAT = pyaudio.paInt16  # 16bit整数
+        self.CHANNELS = 1  # モノラル
+        self.RATE = 44100  # サンプリングレート
+        
+        # 音声処理用の変数
+        self.stream = None
+        self.running = False
+        self.thread = None
+        self.lock = Lock()
+        
+        # FFT解析用のバッファ
+        self.fft_buffer = deque(maxlen=5)  # 過去5フレームのFFT結果を保持
+        
+        # パラメータ設定を調整
+        self.sensitivity = 0.5     # 感度を少し下げる（0.7→0.5）
+        self.smoothing = 0.6      # スムージングを強める（0.3→0.6）
+        self.bass_boost = 1.1     # 低音の強調を抑える（1.3→1.1）
+        
+        # 色変化用の追加パラメータ
+        self.color_smoothing = 0.8  # 色の変化をより滑らかに
+        self.saturation_min = 0.5   # 最小彩度
+        self.value_min = 0.3        # 最小明度
+        
+        # 前回の色とレベル値（スムージング用）
+        self.prev_hue = 0.0
+        self.prev_saturation = 0.0
+        self.prev_value = 0.0
+        self.prev_level = 0.0
+    
+    def start(self):
+        """オーディオ処理を開始"""
+        if self.running:
+            return True
+
+        try:
+            # 利用可能なオーディオデバイスをチェック
+            input_devices = []
+            for i in range(self.p.get_device_count()):
+                device_info = self.p.get_device_info_by_index(i)
+                if device_info['maxInputChannels'] > 0:
+                    input_devices.append(device_info)
+                    self.logger.debug(f"検出されたオーディオ入力デバイス: {device_info['name']}")
+            
+            if not input_devices:
+                self.logger.error("利用可能なオーディオ入力デバイスが見つかりません")
+                return False
+
+            # デフォルトの入力デバイスを使用
+            default_input = self.p.get_default_input_device_info()
+            self.logger.info(f"使用するオーディオ入力デバイス: {default_input['name']}")
+            
+            # オーディオ入力ストリームを開く
+            self.stream = self.p.open(
+                format=self.FORMAT,
+                channels=self.CHANNELS,
+                rate=self.RATE,
+                input=True,
+                input_device_index=default_input['index'],
+                frames_per_buffer=self.CHUNK,
+                stream_callback=self._audio_callback
+            )
+            
+            self.running = True
+            self.thread = Thread(target=self._processing_thread, daemon=True)
+            self.thread.start()
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"オーディオ処理の開始に失敗: {str(e)}")
+            return False
+    
+    def stop(self):
+        """オーディオ処理を停止"""
+        if self.running:
+            self.logger.info("オーディオ処理を停止します")
+        self.running = False
+        
+        if self.stream:
+            try:
+                self.stream.stop_stream()
+                self.stream.close()
+            except:
+                pass
+            finally:
+                self.stream = None
+        
+        if self.thread:
+            self.thread.join(timeout=1.0)
+            self.thread = None
+    
+    def _audio_callback(self, in_data, frame_count, time_info, status):
+        """オーディオコールバック（別スレッドで呼ばれる）"""
+        if status:  # エラー状態をチェック
+            self.logger.warning(f"オーディオコールバックでエラー: {status}")
+            return (None, pyaudio.paAbort)
+            
+        with self.lock:
+            # バッファにデータを追加
+            if self.running:
+                self.fft_buffer.append(in_data)
+        
+        # 処理を続行
+        return (None, pyaudio.paContinue)
+    
+    def _processing_thread(self):
+        """オーディオデータを処理するスレッド"""
+        
+        # 周波数バンドの定義を調整（より細かく）
+        bands = {
+            "low": (20, 200),      # 低音域
+            "mid_low": (200, 800),  # 中低音域
+            "mid": (800, 2500),     # 中音域
+            "high": (2500, 12000)   # 高音域
+        }
+        
+        while self.running:
+            try:
+                # データ取得とFFT処理
+                with self.lock:
+                    if not self.fft_buffer:
+                        time.sleep(0.01)
+                        continue
+                    
+                    # 最新のデータを取得
+                    data = self.fft_buffer.pop()
+                
+                # バイトデータを整数に変換
+                count = len(data) // 2
+                format = f"{count}h"
+                samples = struct.unpack(format, data)
+                
+                # 正規化（-1.0 から 1.0 の範囲に）
+                samples = np.array(samples) / 32768.0
+                
+                # FFT処理
+                fft_data = np.abs(np.fft.rfft(samples))
+                
+                # 周波数ビンのインデックス計算
+                freq_bins = np.fft.rfftfreq(len(samples), 1.0/self.RATE)
+                
+                # 各周波数帯の強度を計算
+                band_levels = {}
+                for band_name, (low_freq, high_freq) in bands.items():
+                    # 該当する周波数範囲のインデックスを取得
+                    band_indices = np.where((freq_bins >= low_freq) & (freq_bins <= high_freq))[0]
+                    
+                    # この帯域の平均振幅を計算
+                    if len(band_indices) > 0:
+                        band_amplitude = np.mean(fft_data[band_indices])
+                        
+                        # 低音域を強調（オプション）
+                        if band_name == "low":
+                            band_amplitude *= self.bass_boost
+                            
+                        band_levels[band_name] = band_amplitude
+                    else:
+                        band_levels[band_name] = 0.0
+                
+                # オーディオレベルの計算（全体の強度）
+                overall_level = np.mean([
+                    band_levels["low"],
+                    band_levels["mid_low"],
+                    band_levels["mid"], 
+                    band_levels["high"]
+                ])
+                
+                # 大きな値が出る可能性があるのでクリップ
+                overall_level = min(1.0, overall_level * self.sensitivity * 5.0)
+                
+                # スムージング処理
+                smoothed_level = (overall_level * (1.0 - self.smoothing) + 
+                                  self.prev_level * self.smoothing)
+                self.prev_level = smoothed_level
+                
+                # 色相計算を改善（より広い色範囲を使用）
+                if band_levels["low"] > 0 and band_levels["high"] > 0:
+                    # 低音と高音のバランスで色相を決定（全色相範囲を使用）
+                    low_intensity = band_levels["low"] * 2.0
+                    high_intensity = band_levels["high"]
+                    balance = low_intensity / (low_intensity + high_intensity)
+                    target_hue = balance  # 0.0-1.0の全範囲を使用
+                else:
+                    target_hue = self.prev_hue
+
+                # 中音のエネルギーで彩度を決定
+                mid_energy = (band_levels["mid_low"] + band_levels["mid"]) * 0.5
+                target_saturation = max(
+                    self.saturation_min,
+                    min(1.0, mid_energy * 3.0 * self.sensitivity)
+                )
+                
+                # 全体の強度で明度を決定（より滑らかな変化）
+                overall_level = np.mean([
+                    band_levels["low"] * 1.2,
+                    band_levels["mid_low"],
+                    band_levels["mid"],
+                    band_levels["high"] * 0.8
+                ])
+                
+                target_value = max(
+                    self.value_min,
+                    min(1.0, overall_level * 2.0 * self.sensitivity + 0.3)
+                )
+                
+                # より強いスムージング処理
+                hue = target_hue * (1.0 - self.color_smoothing) + self.prev_hue * self.color_smoothing
+                saturation = target_saturation * (1.0 - self.color_smoothing) + self.prev_saturation * self.color_smoothing
+                value = target_value * (1.0 - self.color_smoothing) + self.prev_value * self.color_smoothing
+                
+                # 前回の値を更新
+                self.prev_hue = hue
+                self.prev_saturation = saturation
+                self.prev_value = value
+                
+                # HSVからRGBに変換
+                r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
+                
+                # QColorに変換して発信
+                color = QColor(
+                    int(r * 255), 
+                    int(g * 255), 
+                    int(b * 255)
+                )
+                
+                # 信号発信
+                self.color_changed.emit(color)
+                self.audio_level.emit(smoothed_level)
+                
+                # フレームレートを少し下げて安定化
+                time.sleep(0.04)  # 約25FPS
+                
+            except Exception as e:
+                logging.error(f"オーディオ処理中にエラー: {str(e)}")
+                time.sleep(0.1)  # エラー時は少し待機
+    
+    def cleanup(self):
+        """リソースの解放"""
+        self.stop()
+        if self.p:
+            self.p.terminate()
+            self.p = None
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -641,6 +1002,11 @@ class MainWindow(QMainWindow):
         self.current_color = QColor(255, 255, 255)
         self.current_hue = 0
         self.auto_mode = False
+        self.audio_mode = False
+        
+        # オーディオプロセッサの初期化
+        self.audio_processor = AudioProcessor()
+        self.audio_processor.color_changed.connect(self.update_audio_color)
         
         # BLEコントローラーの初期化
         self.ble_controller = BLEController()
@@ -672,6 +1038,11 @@ class MainWindow(QMainWindow):
         self.logger.addHandler(text_handler)
         
         self.logger.info("シリウス3 LEDコントローラーを起動しました")
+        
+        # 接続状態定期チェック用タイマー
+        self.connection_check_timer = QTimer(self)
+        self.connection_check_timer.timeout.connect(self.check_connections)
+        self.connection_check_timer.start(5000)  # 5秒ごとに接続状態をチェック
     
     def init_ui(self):
         self.setWindowTitle("Sirius3 LED Controller")
@@ -748,10 +1119,32 @@ class MainWindow(QMainWindow):
         
         # 動作モード
         mode_layout = QHBoxLayout()
-        self.auto_mode_check = QCheckBox("自動色相変化モード")
-        self.auto_mode_check.stateChanged.connect(self.mode_changed)
-        mode_layout.addWidget(self.auto_mode_check)
+        
+        # モード選択ラジオボタン
+        self.mode_group = QButtonGroup(self)
+        
+        self.fixed_mode_radio = QRadioButton("固定色モード")
+        self.fixed_mode_radio.setChecked(True)
+        self.fixed_mode_radio.toggled.connect(self.on_mode_changed)
+        self.mode_group.addButton(self.fixed_mode_radio)
+        
+        self.auto_mode_radio = QRadioButton("自動色相変化モード")
+        self.auto_mode_radio.toggled.connect(self.on_mode_changed)
+        self.mode_group.addButton(self.auto_mode_radio)
+        
+        self.audio_mode_radio = QRadioButton("音楽連動モード")
+        self.audio_mode_radio.toggled.connect(self.on_mode_changed)
+        self.mode_group.addButton(self.audio_mode_radio)
+        
+        mode_layout.addWidget(self.fixed_mode_radio)
+        mode_layout.addWidget(self.auto_mode_radio)
+        mode_layout.addWidget(self.audio_mode_radio)
+        
         color_layout.addLayout(mode_layout)
+        
+        # 自動モードのチェックボックスは非表示にする（ラジオボタンに置き換え）
+        self.auto_mode_check = QCheckBox("自動色相変化モード")
+        self.auto_mode_check.setVisible(False)
         
         color_group.setLayout(color_layout)
         top_layout.addWidget(color_group)
@@ -967,13 +1360,101 @@ class MainWindow(QMainWindow):
         )
         self.color_preview.setColor(self.current_color)
     
-    def mode_changed(self, state):
-        """動作モードが変更されたときの処理"""
-        self.auto_mode = (state == Qt.Checked)
-        # モード変更時にプレビュー表示を更新
-        if self.auto_mode:
-            # 自動モードの場合は現在の色相を使用
-            self.hue_changed(self.current_hue)
+    def on_mode_changed(self):
+        """モード切替ラジオボタンが変更されたときの処理"""
+        if self.fixed_mode_radio.isChecked():
+            self.auto_mode = False
+            self.audio_mode = False
+            self.color_picker_btn.setEnabled(True)
+            self.hue_slider.setEnabled(True)
+            
+            # オーディオ処理を停止
+            self.audio_processor.stop()
+            self.ble_controller.set_audio_mode(False)
+            
+        elif self.auto_mode_radio.isChecked():
+            self.auto_mode = True
+            self.audio_mode = False
+            self.color_picker_btn.setEnabled(False)
+            self.hue_slider.setEnabled(True)
+            
+            # オーディオ処理を停止
+            self.audio_processor.stop()
+            self.ble_controller.set_audio_mode(False)
+            
+        elif self.audio_mode_radio.isChecked():
+            self.auto_mode = False
+            self.audio_mode = True
+            self.color_picker_btn.setEnabled(False)
+            self.hue_slider.setEnabled(False)
+            
+            # オーディオ処理を開始
+            if not self.audio_processor.start():
+                self.logger.error("オーディオ処理の開始に失敗しました")
+                self.audio_mode_radio.setChecked(False)
+                self.fixed_mode_radio.setChecked(True)
+                return
+                
+            self.ble_controller.set_audio_mode(True)
+        
+        # 現在選択されているモードをログに出力
+        mode_name = "固定色" if self.fixed_mode_radio.isChecked() else \
+                    "自動色相変化" if self.auto_mode_radio.isChecked() else \
+                    "音楽連動" if self.audio_mode_radio.isChecked() else "不明"
+        self.logger.info(f"モードを変更: {mode_name}")
+    
+    def update_audio_color(self, color):
+        """オーディオ処理からの色更新を受け取る"""
+        if not self.audio_mode:
+            return
+            
+        # プレビューの色を更新
+        self.current_color = color
+        self.color_preview.setColor(color)
+        
+        # BLEコントローラーに色を送信
+        self.ble_controller.update_audio_color(color)
+    
+    def reload_connection(self, device_key):
+        """接続状態を再確認"""
+        if device_key not in ["LEFT", "RIGHT"]:
+            return
+        
+        # リロードボタンを一時的に無効化
+        reload_btn = getattr(self, f"{device_key.lower()}_reload_btn", None)
+        if reload_btn:
+            reload_btn.setEnabled(False)
+        
+        # ステータスラベルの表示を更新
+        status_label = getattr(self, f"{device_key.lower()}_status_label")
+        status_label.setText("確認中...")
+        status_label.setStyleSheet("color: blue; font-weight: bold;")
+        
+        # 接続状態をチェック
+        future = self.ble_controller.check_connection(device_key)
+        
+        def on_check_done(f):
+            if reload_btn:
+                reload_btn.setEnabled(True)
+            try:
+                result = f.result()
+                self.logger.info(f"{device_key}デバイスの接続状態確認: {'接続中' if result else '未接続'}")
+            except Exception as e:
+                self.logger.error(f"接続確認中にエラーが発生: {str(e)}")
+        
+        future.add_done_callback(on_check_done)
+    
+    def check_connections(self):
+        """全デバイスの接続状態を定期的にチェック"""
+        futures = self.ble_controller.check_all_connections()
+        for future in futures:
+            def on_done(f):
+                try:
+                    f.result()  # 例外をキャッチするため
+                except Exception as e:
+                    self.logger.debug(f"接続チェック中にエラー: {str(e)}")
+            
+            future.add_done_callback(on_done)
     
     def apply_settings(self, device_key):
         """設定をデバイスに適用"""
@@ -993,8 +1474,17 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # 不定のプログレス表示
         
+        # 現在のモードを取得
+        if self.audio_mode:
+            # 音楽連動モードの場合は、そのままオーディオ処理に委任
+            self.status_label.setText(f"{device_key}デバイスは音楽連動モードで動作中です")
+            self.status_label.setStyleSheet("color: green;")
+            self.progress_bar.setVisible(False)
+            btn.setEnabled(True)
+            return
+            
         # 自動モードかどうか
-        auto_mode = self.auto_mode_check.isChecked()
+        auto_mode = self.auto_mode
         
         # 色の値を取得
         r, g, b = self.current_color.red(), self.current_color.green(), self.current_color.blue()
@@ -1035,8 +1525,16 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # 不定のプログレス表示
         
+        # 音楽連動モードの場合
+        if self.audio_mode:
+            self.status_label.setText("両方のデバイスは音楽連動モードで動作中です")
+            self.status_label.setStyleSheet("color: green;")
+            self.progress_bar.setVisible(False)
+            self.apply_both_btn.setEnabled(True)
+            return
+            
         # 自動モードかどうか
-        auto_mode = self.auto_mode_check.isChecked()
+        auto_mode = self.auto_mode
         
         # 色の値を取得
         r, g, b = self.current_color.red(), self.current_color.green(), self.current_color.blue()
@@ -1066,6 +1564,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """アプリケーション終了時の処理"""
         self.logger.info("アプリケーションを終了します")
+        
+        # オーディオ処理を停止
+        if hasattr(self, 'audio_processor'):
+            self.audio_processor.cleanup()
         
         # リソース解放
         self.ble_controller.cleanup()

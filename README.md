@@ -1,0 +1,1 @@
+[XIAOESP32C6](https://wiki.seeedstudio.com/xiao_esp32c6_bluetooth/)
