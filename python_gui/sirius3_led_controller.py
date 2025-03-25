@@ -1126,7 +1126,7 @@ class MainWindow(QMainWindow):
     
     def init_ui(self):
         self.setWindowTitle("Sirius3 LED Controller")
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(800, 900)
         
         # メインレイアウト（上下分割）
         main_splitter = QSplitter(Qt.Vertical)
