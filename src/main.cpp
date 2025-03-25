@@ -30,6 +30,16 @@
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
+// 色遷移のデフォルト時間（ミリ秒）
+#define DEFAULT_TRANSITION_TIME 1000
+
+// 色設定モードの定義
+enum ColorMode {
+  MODE_AUTO,      // 自動色相変化モード
+  MODE_FIXED,     // 固定色モード（C:コマンド）
+  MODE_TRANSITION // 遷移モード（T:コマンド）
+};
+
 // LEDアレイの定義
 CRGB leds[NUM_LEDS];
 
@@ -39,6 +49,14 @@ bool autoHueChange = true; // 自動色相変化モード
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 CRGB currentColor = CRGB::White; // 初期色は白
+ColorMode colorMode = MODE_AUTO; // 初期モードは自動色相変化
+
+// 色遷移関連の変数
+bool isTransitioning = false; // 色遷移中かどうか
+CRGB startColor;             // 遷移開始色
+CRGB targetColor;            // 遷移目標色
+unsigned long transitionStartTime = 0; // 遷移開始時刻
+unsigned long transitionDuration = DEFAULT_TRANSITION_TIME; // 遷移時間
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
@@ -72,6 +90,8 @@ class MyCallbacks: public BLECharacteristicCallbacks {
           sscanf(value.c_str(), "C:%d,%d,%d", &r, &g, &b);
           currentColor = CRGB(r, g, b);
           autoHueChange = false;
+          isTransitioning = false; // 即時変更なので遷移をキャンセル
+          colorMode = MODE_FIXED;  // 固定色モードに設定
           Serial.printf("色を設定: R=%d, G=%d, B=%d\n", r, g, b);
         } 
         else if (value[0] == 'H' && value[1] == ':') {
@@ -80,6 +100,8 @@ class MyCallbacks: public BLECharacteristicCallbacks {
           sscanf(value.c_str(), "H:%d", &hue);
           gHue = hue;
           autoHueChange = false;
+          isTransitioning = false; // 即時変更なので遷移をキャンセル
+          colorMode = MODE_FIXED;  // 固定色モードに設定（H:は固定色の一種）
           Serial.printf("色相を設定: %d\n", hue);
         }
         else if (value[0] == 'M' && value[1] == ':') {
@@ -87,7 +109,38 @@ class MyCallbacks: public BLECharacteristicCallbacks {
           int mode;
           sscanf(value.c_str(), "M:%d", &mode);
           autoHueChange = (mode == 1);
+          isTransitioning = false; // モード変更時は遷移をキャンセル
+          colorMode = autoHueChange ? MODE_AUTO : MODE_FIXED;  // 自動モードと固定モードを切り替え
           Serial.printf("モードを設定: %s\n", autoHueChange ? "自動色相変化" : "固定色");
+        }
+        else if (value[0] == 'T' && value[1] == ':') {
+          // 色遷移コマンド（例: T:255,0,0,2000）
+          // T:R,G,B,TIME で、現在の色から指定色に TIME ミリ秒かけて遷移
+          int r, g, b, time = DEFAULT_TRANSITION_TIME;
+          int parsed = sscanf(value.c_str(), "T:%d,%d,%d,%d", &r, &g, &b, &time);
+          
+          // 必須のRGB値が解析できたか確認
+          if (parsed >= 3) {
+            // 遷移パラメータを設定 - 常に現在の色から開始（遷移中でも）
+            startColor = currentColor; // 現在の色を開始色に（遷移中の色も含む）
+            targetColor = CRGB(r, g, b); // 目標色を設定
+            transitionDuration = (parsed == 4) ? time : DEFAULT_TRANSITION_TIME; // 時間が省略されていればデフォルト値を使用
+            transitionStartTime = millis(); // 現在時刻を記録
+            isTransitioning = true; // 遷移モードを有効に
+            autoHueChange = false; // 自動色相変化を無効に
+            colorMode = MODE_TRANSITION;  // 遷移モードに設定
+            
+            if (startColor.r == targetColor.r && startColor.g == targetColor.g && startColor.b == targetColor.b) {
+              // 開始色と目標色が同じ場合は遷移不要
+              isTransitioning = false;
+              Serial.println("開始色と目標色が同じため、遷移はスキップされます");
+            } else {
+              Serial.printf("色遷移開始: 現在色(R=%d,G=%d,B=%d)から目標色(R=%d,G=%d,B=%d)へ %dミリ秒で遷移\n", 
+                         startColor.r, startColor.g, startColor.b,
+                         targetColor.r, targetColor.g, targetColor.b,
+                         transitionDuration);
+            }
+          }
         }
       }
     }
@@ -142,13 +195,38 @@ void loop() {
     oldDeviceConnected = deviceConnected;
   }
 
-  // 自動色相変化モードの場合
-  if (autoHueChange) {
+  // 色遷移処理
+  if (isTransitioning) {
+    unsigned long currentTime = millis();
+    unsigned long elapsedTime = currentTime - transitionStartTime;
+    
+    if (elapsedTime >= transitionDuration) {
+      // 遷移完了
+      currentColor = targetColor;
+      isTransitioning = false;
+      // ここでモードは変更しない（colorMode = MODE_TRANSITIONのまま）
+      Serial.println("色遷移完了");
+    } else {
+      // 遷移中
+      float progress = (float)elapsedTime / transitionDuration; // 0.0 から 1.0 の進行度
+      
+      // 線形補間で現在の色を計算
+      currentColor.r = startColor.r + (targetColor.r - startColor.r) * progress;
+      currentColor.g = startColor.g + (targetColor.g - startColor.g) * progress;
+      currentColor.b = startColor.b + (targetColor.b - startColor.b) * progress;
+    }
+    
+    // 遷移中の色で全LEDを設定
+    fill_solid(leds, NUM_LEDS, currentColor);
+  }
+  // モードに応じたLED制御
+  else if (colorMode == MODE_AUTO) {
+    // 自動色相変化モード
     EVERY_N_MILLISECONDS(20) { gHue++; } // 色相を緩やかに変化
-    // すべてのLEDを同じ色にする
     fill_solid(leds, NUM_LEDS, CHSV(gHue, 255, 255));
-  } else {
-    // 固定色モードの場合
+  } 
+  else if (colorMode == MODE_FIXED || colorMode == MODE_TRANSITION) {
+    // 固定色モードまたは遷移完了後（現在のcolorModeを維持）
     if (currentColor.r == 0 && currentColor.g == 0 && currentColor.b == 0) {
       // 特定の色相の色を使用
       fill_solid(leds, NUM_LEDS, CHSV(gHue, 255, 255));

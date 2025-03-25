@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QGroupBox, QCheckBox, QColorDialog, QMessageBox,
                               QTextEdit, QSplitter, QProgressBar, QRadioButton,
                               QButtonGroup)
-from PySide6.QtCore import Qt, Signal, Slot, QObject, QTimer, QSize
+from PySide6.QtCore import Qt, Signal, Slot, QObject, QTimer, QSize, QEvent
 from PySide6.QtGui import QColor, QPainter, QBrush, QTextCursor, QFont
 
 # BLEデバイス情報
@@ -38,6 +38,7 @@ CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 CMD_MODE = "M"      # モード設定 (0:固定色、1:自動色相変化)
 CMD_COLOR = "C"     # RGB色設定
 CMD_HUE = "H"       # 色相設定
+CMD_TRANSITION = "T" # 色遷移設定
 
 # ロギング設定
 class QTextEditLogger(logging.Handler):
@@ -67,12 +68,35 @@ class QTextEditLogger(logging.Handler):
         color = self.level_colors.get(record.levelno, "white")
         
         # メインスレッドからの呼び出しを保証
-        self.widget.textCursor().insertHtml(
-            f'<font color="{color}">{msg}</font><br>'
+        QApplication.instance().postEvent(
+            self.widget,
+            LogUpdateEvent(f'<font color="{color}">{msg}</font><br>')
         )
+
+# LogUpdateEventを追加
+class LogUpdateEvent(QEvent):
+    def __init__(self, html_text):
+        super().__init__(QEvent.Type(QEvent.User + 1))
+        self.html_text = html_text
+
+# ウィジェットにイベントハンドラを追加
+class LogTextEdit(QTextEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setFont(QFont("Monospace", 9))
         
-        # 自動スクロール
-        self.widget.moveCursor(QTextCursor.End)
+    def event(self, event):
+        if event.type() == QEvent.User + 1:
+            # LogUpdateEventからのテキスト更新
+            cursor = self.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            cursor.insertHtml(event.html_text)
+            self.setTextCursor(cursor)
+            # 自動スクロール
+            self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
+            return True
+        return super().event(event)
         
 # BLEコマンドキュー項目
 class BLECommand:
@@ -89,6 +113,9 @@ class BLECommand:
         if self.cmd_type == CMD_COLOR:
             r, g, b = self.value
             return f"{self.cmd_type}:{r},{g},{b}"
+        elif self.cmd_type == CMD_TRANSITION:
+            r, g, b, duration = self.value
+            return f"{self.cmd_type}:{r},{g},{b},{duration}"
         else:
             return f"{self.cmd_type}:{self.value}"
             
@@ -506,6 +533,10 @@ class BLEController(QObject):
         """色相を設定 (0-255)"""
         self.enqueue_command(device_key, CMD_HUE, hue, callback)
     
+    def set_transition_color(self, device_key, r, g, b, duration=1000, callback=None):
+        """指定した色へ滑らかに遷移"""
+        self.enqueue_command(device_key, CMD_TRANSITION, (r, g, b, duration), callback)
+    
     def apply_settings(self, device_key, auto_mode, r=0, g=0, b=0, hue=0, callback=None):
         """設定を適用"""
         if auto_mode:
@@ -808,6 +839,10 @@ class AudioProcessor(QObject):
         
         # 色相範囲の制限（0-1の範囲で）
         self.hue_range = (0.0, 0.85)  # 赤から紫までの範囲
+        
+        # 音声反応の更新間隔調整 (ミリ秒)
+        self.update_interval = 150  # 0.15秒ごとに更新
+        self.last_update_time = 0
     
     def start(self):
         """オーディオ処理を開始"""
@@ -1008,9 +1043,12 @@ class AudioProcessor(QObject):
                     int(b * 255)
                 )
                 
-                # 信号発信
-                self.color_changed.emit(color)
-                self.audio_level.emit(smoothed_value)
+                # 更新間隔を制限して信号発信
+                current_time = int(time.time() * 1000)  # 現在時刻（ミリ秒）
+                if current_time - self.last_update_time >= self.update_interval:
+                    self.color_changed.emit(color)
+                    self.audio_level.emit(smoothed_value)
+                    self.last_update_time = current_time
                 
                 # フレームレートを調整
                 time.sleep(0.04)  # 25FPSに制限してより安定した表示に
@@ -1173,6 +1211,18 @@ class MainWindow(QMainWindow):
         
         color_layout.addLayout(mode_layout)
         
+        # 音楽連動モード設定
+        audio_settings_layout = QHBoxLayout()
+        audio_settings_layout.addWidget(QLabel("音声連動更新間隔:"))
+        self.audio_interval_slider = QSlider(Qt.Horizontal)
+        self.audio_interval_slider.setRange(100, 500)  # 0.1秒から0.5秒
+        self.audio_interval_slider.setValue(150)  # デフォルト0.15秒
+        self.audio_interval_slider.valueChanged.connect(self.update_audio_interval)
+        audio_settings_layout.addWidget(self.audio_interval_slider)
+        self.audio_interval_label = QLabel("150 ms")
+        audio_settings_layout.addWidget(self.audio_interval_label)
+        color_layout.addLayout(audio_settings_layout)
+        
         # 自動モードのチェックボックスは非表示にする（ラジオボタンに置き換え）
         self.auto_mode_check = QCheckBox("自動色相変化モード")
         self.auto_mode_check.setVisible(False)
@@ -1180,51 +1230,95 @@ class MainWindow(QMainWindow):
         color_group.setLayout(color_layout)
         top_layout.addWidget(color_group)
         
+        # 色遷移設定
+        transition_group = QGroupBox("色遷移設定")
+        transition_layout = QVBoxLayout()
+        
+        # 遷移時間スライダー
+        transition_time_layout = QHBoxLayout()
+        transition_time_layout.addWidget(QLabel("遷移時間:"))
+        self.transition_time_slider = QSlider(Qt.Horizontal)
+        self.transition_time_slider.setRange(100, 5000)  # 0.1秒から5秒
+        self.transition_time_slider.setValue(1000)       # デフォルト1秒
+        self.transition_time_slider.setTickInterval(500)
+        self.transition_time_slider.setTickPosition(QSlider.TicksBelow)
+        self.transition_time_slider.valueChanged.connect(self.update_transition_time_label)
+        transition_time_layout.addWidget(self.transition_time_slider)
+        self.transition_time_label = QLabel("1000 ms")
+        transition_time_layout.addWidget(self.transition_time_label)
+        
+        transition_layout.addLayout(transition_time_layout)
+        
+        # 遷移ボタン
+        transition_btn_layout = QHBoxLayout()
+        self.transition_left_btn = QPushButton("LEFT EARに遷移")
+        self.transition_left_btn.clicked.connect(lambda: self.apply_transition("LEFT"))
+        self.transition_left_btn.setEnabled(False)
+        
+        self.transition_right_btn = QPushButton("RIGHT EARに遷移")
+        self.transition_right_btn.clicked.connect(lambda: self.apply_transition("RIGHT"))
+        self.transition_right_btn.setEnabled(False)
+        
+        self.transition_both_btn = QPushButton("両方に遷移")
+        self.transition_both_btn.clicked.connect(self.apply_transition_to_both)
+        self.transition_both_btn.setEnabled(False)
+        
+        transition_btn_layout.addWidget(self.transition_left_btn)
+        transition_btn_layout.addWidget(self.transition_right_btn)
+        transition_btn_layout.addWidget(self.transition_both_btn)
+        
+        transition_layout.addLayout(transition_btn_layout)
+        transition_group.setLayout(transition_layout)
+        
+        top_layout.addWidget(transition_group)
+        
         # 適用ボタン
         apply_group = QGroupBox("設定適用")
         apply_layout = QHBoxLayout()
         
         self.apply_left_btn = QPushButton("LEFT EARに適用")
-        self.apply_left_btn.setMinimumHeight(50)
+        self.apply_left_btn.setMinimumHeight(40)
         self.apply_left_btn.clicked.connect(lambda: self.apply_settings("LEFT"))
         self.apply_left_btn.setEnabled(False)
         
         self.apply_right_btn = QPushButton("RIGHT EARに適用")
-        self.apply_right_btn.setMinimumHeight(50)
+        self.apply_right_btn.setMinimumHeight(40)
         self.apply_right_btn.clicked.connect(lambda: self.apply_settings("RIGHT"))
         self.apply_right_btn.setEnabled(False)
         
         self.apply_both_btn = QPushButton("両方に適用")
-        self.apply_both_btn.setMinimumHeight(50)
-        self.apply_both_btn.setStyleSheet("font-weight: bold;")
+        self.apply_both_btn.setMinimumHeight(40)
         self.apply_both_btn.clicked.connect(self.apply_to_both)
         self.apply_both_btn.setEnabled(False)
         
         apply_layout.addWidget(self.apply_left_btn)
         apply_layout.addWidget(self.apply_right_btn)
         apply_layout.addWidget(self.apply_both_btn)
+        
         apply_group.setLayout(apply_layout)
         top_layout.addWidget(apply_group)
         
         # ステータス表示
         status_layout = QHBoxLayout()
-        status_layout.addWidget(QLabel("ステータス:"))
         self.status_label = QLabel("準備完了")
         status_layout.addWidget(self.status_label)
+        
         self.progress_bar = QProgressBar()
-        self.progress_bar.setMaximumHeight(15)
         self.progress_bar.setVisible(False)
         status_layout.addWidget(self.progress_bar)
+        
         top_layout.addLayout(status_layout)
         
-        # 下部ウィジェット（ログ表示）
+        # 下部ウィジェット（ログ部分）
         bottom_widget = QWidget()
         bottom_layout = QVBoxLayout(bottom_widget)
         
+        # ログ表示部分
         log_group = QGroupBox("ログ")
         log_layout = QVBoxLayout()
         
-        self.log_text = QTextEdit()
+        # LogTextEditクラスのインスタンスを使用
+        self.log_text = LogTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setLineWrapMode(QTextEdit.NoWrap)
         log_layout.addWidget(self.log_text)
@@ -1244,7 +1338,7 @@ class MainWindow(QMainWindow):
         main_splitter.setSizes([400, 200])
         
         self.setCentralWidget(main_splitter)
-    
+
     def log_message(self, level, message):
         """ログメッセージを記録"""
         if level == logging.DEBUG:
@@ -1324,6 +1418,18 @@ class MainWindow(QMainWindow):
         
         # 両方に適用ボタンの状態を更新
         self.apply_both_btn.setEnabled(
+            self.ble_controller.connected.get("LEFT", False) and 
+            self.ble_controller.connected.get("RIGHT", False)
+        )
+        
+        # 遷移ボタンの状態も更新
+        if device_key == "LEFT":
+            self.transition_left_btn.setEnabled(connected)
+        else:  # RIGHT
+            self.transition_right_btn.setEnabled(connected)
+        
+        # 両方に遷移ボタンの状態を更新
+        self.transition_both_btn.setEnabled(
             self.ble_controller.connected.get("LEFT", False) and 
             self.ble_controller.connected.get("RIGHT", False)
         )
@@ -1592,6 +1698,107 @@ class MainWindow(QMainWindow):
         # 色相値も含めて設定を適用
         self.ble_controller.apply_settings_to_both(auto_mode, r, g, b, hue, on_both_complete)
     
+    def apply_transition(self, device_key):
+        """遷移設定をデバイスに適用"""
+        if not self.ble_controller.connected.get(device_key, False):
+            self.logger.warning(f"{device_key}デバイスは接続されていません")
+            return
+        
+        # 音楽連動モード中でも遷移コマンドは適用可能にする
+        if self.audio_mode:
+            self.logger.info(f"音楽連動モード中に{device_key}デバイスへ色遷移コマンドを適用します")
+            # ステータスメッセージを変更する代わりに、処理を続行
+        
+        # ボタンを一時的に無効化
+        btn = self.transition_left_btn if device_key == "LEFT" else self.transition_right_btn
+        btn.setEnabled(False)
+        
+        # ステータス表示
+        self.status_label.setText(f"{device_key}デバイスに色遷移を適用中...")
+        self.status_label.setStyleSheet("color: blue;")
+        
+        # プログレスバーを表示
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # 不定のプログレス表示
+        
+        # 色の値を取得
+        r, g, b = self.current_color.red(), self.current_color.green(), self.current_color.blue()
+        
+        # 遷移時間を取得
+        transition_time = self.transition_time_slider.value()
+        
+        # 設定適用
+        def on_transition_complete(success):
+            btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+            
+            if success:
+                self.status_label.setText(f"{device_key}デバイスへの色遷移を開始しました（{transition_time}ms）")
+                self.status_label.setStyleSheet("color: green;")
+            else:
+                self.status_label.setText(f"{device_key}デバイスへの色遷移開始に失敗しました")
+                self.status_label.setStyleSheet("color: red;")
+        
+        # 色遷移コマンドを送信
+        self.ble_controller.set_transition_color(device_key, r, g, b, transition_time, on_transition_complete)
+    
+    def apply_transition_to_both(self):
+        """両方のデバイスに遷移設定を適用"""
+        if not (self.ble_controller.connected.get("LEFT", False) and self.ble_controller.connected.get("RIGHT", False)):
+            self.logger.warning("両方のデバイスが接続されていません")
+            return
+        
+        # 音楽連動モード中でも遷移コマンドは適用可能にする
+        if self.audio_mode:
+            self.logger.info("音楽連動モード中に両方のデバイスへ色遷移コマンドを適用します")
+            # ステータスメッセージを変更する代わりに、処理を続行
+        
+        # ボタンを一時的に無効化
+        self.transition_both_btn.setEnabled(False)
+        
+        # ステータス表示
+        self.status_label.setText("両方のデバイスに色遷移を適用中...")
+        self.status_label.setStyleSheet("color: blue;")
+        
+        # プログレスバーを表示
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # 不定のプログレス表示
+        
+        # 色の値を取得
+        r, g, b = self.current_color.red(), self.current_color.green(), self.current_color.blue()
+        
+        # 遷移時間を取得
+        transition_time = self.transition_time_slider.value()
+        
+        # 接続済みのデバイスを確認
+        connected_devices = []
+        for device_key in ["LEFT", "RIGHT"]:
+            if self.ble_controller.connected.get(device_key, False):
+                connected_devices.append(device_key)
+        
+        # 同時に遷移コマンドを送信
+        commands = []
+        for device_key in connected_devices:
+            commands.append((device_key, CMD_TRANSITION, (r, g, b, transition_time)))
+        
+        # 設定適用
+        def on_both_complete(success):
+            self.transition_both_btn.setEnabled(
+                self.ble_controller.connected.get("LEFT", False) and 
+                self.ble_controller.connected.get("RIGHT", False)
+            )
+            self.progress_bar.setVisible(False)
+            
+            if success:
+                self.status_label.setText(f"両方のデバイスへの色遷移を開始しました（{transition_time}ms）")
+                self.status_label.setStyleSheet("color: green;")
+            else:
+                self.status_label.setText("色遷移開始に一部失敗しました")
+                self.status_label.setStyleSheet("color: orange;")
+        
+        # コマンド送信
+        self.ble_controller._send_commands_simultaneously(commands, on_both_complete)
+    
     def closeEvent(self, event):
         """アプリケーション終了時の処理"""
         self.logger.info("アプリケーションを終了します")
@@ -1614,6 +1821,17 @@ class MainWindow(QMainWindow):
                     pass
         
         event.accept()
+
+    def update_audio_interval(self, value):
+        """音声連動更新間隔の設定を更新"""
+        self.audio_interval_label.setText(f"{value} ms")
+        if hasattr(self, 'audio_processor'):
+            self.audio_processor.update_interval = value
+            self.logger.info(f"音声連動更新間隔を {value} msに設定しました")
+
+    def update_transition_time_label(self, value):
+        """遷移時間ラベルを更新"""
+        self.transition_time_label.setText(f"{value} ms")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

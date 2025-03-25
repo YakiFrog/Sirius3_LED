@@ -8,7 +8,7 @@ import asyncio
 import logging
 from bleak import BleakScanner, BleakClient
 from PySide6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, QPushButton, 
-                             QLabel, QComboBox, QLineEdit, QTextEdit, QWidget)
+                             QLabel, QComboBox, QLineEdit, QTextEdit, QWidget, QSpinBox)
 from PySide6.QtCore import Qt
 
 # UUIDの定義
@@ -77,7 +77,10 @@ class DebugWindow(QMainWindow):
             "C:255,0,0 (赤色)",
             "C:0,255,0 (緑色)",
             "C:0,0,255 (青色)",
-            "C:255,255,255 (白色)"
+            "C:255,255,255 (白色)",
+            "T:255,0,0,1000 (赤色に1秒で遷移)",
+            "T:0,255,0,2000 (緑色に2秒で遷移)",
+            "T:0,0,255,500 (青色に0.5秒で遷移)"
         ])
         preset_layout.addWidget(self.preset_combo)
         self.send_preset_btn = QPushButton("送信")
@@ -90,7 +93,7 @@ class DebugWindow(QMainWindow):
         custom_layout = QHBoxLayout()
         custom_layout.addWidget(QLabel("カスタム:"))
         self.command_input = QLineEdit()
-        self.command_input.setPlaceholderText("例: M:1 または H:128 または C:255,0,0")
+        self.command_input.setPlaceholderText("例: M:1 または H:128 または C:255,0,0 または T:255,0,0,1000")
         custom_layout.addWidget(self.command_input)
         self.send_custom_btn = QPushButton("送信")
         self.send_custom_btn.clicked.connect(self.send_custom)
@@ -98,11 +101,70 @@ class DebugWindow(QMainWindow):
         custom_layout.addWidget(self.send_custom_btn)
         layout.addLayout(custom_layout)
         
+        # 色遷移コマンド
+        transition_group = QWidget()
+        transition_layout = QVBoxLayout(transition_group)
+        transition_layout.addWidget(QLabel("色遷移コマンド (T:):"))
+        
+        # 説明文
+        transition_info = QLabel("色遷移コマンド(T:)は全モードで使用可能。遷移中に新しいコマンドが送られると、その時点の色から新しい目標色へ遷移します。")
+        transition_info.setWordWrap(True)
+        transition_info.setStyleSheet("color: blue;")
+        transition_layout.addWidget(transition_info)
+        
+        # RGB値の入力
+        rgb_layout = QHBoxLayout()
+        rgb_layout.addWidget(QLabel("R:"))
+        self.r_input = QSpinBox()
+        self.r_input.setRange(0, 255)
+        self.r_input.setValue(255)
+        rgb_layout.addWidget(self.r_input)
+        
+        rgb_layout.addWidget(QLabel("G:"))
+        self.g_input = QSpinBox()
+        self.g_input.setRange(0, 255)
+        self.g_input.setValue(0)
+        rgb_layout.addWidget(self.g_input)
+        
+        rgb_layout.addWidget(QLabel("B:"))
+        self.b_input = QSpinBox()
+        self.b_input.setRange(0, 255)
+        self.b_input.setValue(0)
+        rgb_layout.addWidget(self.b_input)
+        
+        transition_layout.addLayout(rgb_layout)
+        
+        # 遷移時間の入力
+        time_layout = QHBoxLayout()
+        time_layout.addWidget(QLabel("遷移時間 (ミリ秒):"))
+        self.time_input = QSpinBox()
+        self.time_input.setRange(100, 10000)
+        self.time_input.setSingleStep(100)
+        self.time_input.setValue(1000)
+        time_layout.addWidget(self.time_input)
+        
+        self.send_transition_btn = QPushButton("遷移開始")
+        self.send_transition_btn.clicked.connect(self.send_transition)
+        self.send_transition_btn.setEnabled(False)
+        time_layout.addWidget(self.send_transition_btn)
+        
+        transition_layout.addLayout(time_layout)
+        layout.addWidget(transition_group)
+        
         # ログ表示
         layout.addWidget(QLabel("ログ:"))
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         layout.addWidget(self.log_text)
+        
+        # 起動時の説明を追加
+        self.log("Sirius3 LEDデバッグツールを起動しました")
+        self.log("コマンド一覧:")
+        self.log("・M:0/1 - モード設定 (0:固定色モード、1:自動色相変化モード)")
+        self.log("・C:R,G,B - RGB色設定 (例: C:255,0,0 で赤色)")
+        self.log("・H:hue - 色相設定 (0-255の値)")
+        self.log("・T:R,G,B,time - 色遷移 (例: T:255,0,0,1000 で1秒かけて赤色に遷移)")
+        self.log("※T:コマンドは全モード（自動/固定/音声連動）で使用可能です")
         
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
@@ -152,6 +214,7 @@ class DebugWindow(QMainWindow):
                     self.disconnect_btn.setEnabled(True)
                     self.send_preset_btn.setEnabled(True)
                     self.send_custom_btn.setEnabled(True)
+                    self.send_transition_btn.setEnabled(True)
                     self.log("接続成功")
                 else:
                     self.status_label.setText("ステータス: 接続失敗")
@@ -179,6 +242,7 @@ class DebugWindow(QMainWindow):
                 self.disconnect_btn.setEnabled(False)
                 self.send_preset_btn.setEnabled(False)
                 self.send_custom_btn.setEnabled(False)
+                self.send_transition_btn.setEnabled(False)
                 self.client = None
         
         asyncio.set_event_loop(self.loop)
@@ -193,6 +257,17 @@ class DebugWindow(QMainWindow):
         command = self.command_input.text().strip()
         if command:
             self.send_command(command)
+    
+    def send_transition(self):
+        r = self.r_input.value()
+        g = self.g_input.value()
+        b = self.b_input.value()
+        time_ms = self.time_input.value()
+        
+        command = f"T:{r},{g},{b},{time_ms}"
+        self.send_command(command)
+        self.log(f"色遷移コマンド送信: 目標RGB({r},{g},{b})、遷移時間{time_ms}ms")
+        self.log("※遷移コマンドは遷移完了後もT:モードを維持します")
     
     def send_command(self, command):
         self.log(f"コマンド送信: {command}")
