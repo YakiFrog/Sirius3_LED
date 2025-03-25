@@ -1,0 +1,1003 @@
+import sys
+import time
+import asyncio
+import logging
+import queue
+import concurrent.futures
+from threading import Thread, Lock, Event
+from functools import partial
+from datetime import datetime
+
+from bleak import BleakScanner, BleakClient
+from bleak.exc import BleakError, BleakDeviceNotFoundError
+
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                              QHBoxLayout, QPushButton, QLabel, QSlider, QComboBox,
+                              QGroupBox, QCheckBox, QColorDialog, QMessageBox,
+                              QTextEdit, QSplitter, QProgressBar)
+from PySide6.QtCore import Qt, Signal, Slot, QObject, QTimer, QSize
+from PySide6.QtGui import QColor, QPainter, QBrush, QTextCursor, QFont
+
+# BLEデバイス情報
+DEVICE_NAMES = {
+    "LEFT": "Sirius3_LEFT_EAR",
+    "RIGHT": "Sirius3_RIGHT_EAR"
+}
+
+# UUIDの定義
+SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+# コマンドタイプの定義
+CMD_MODE = "M"      # モード設定 (0:固定色、1:自動色相変化)
+CMD_COLOR = "C"     # RGB色設定
+CMD_HUE = "H"       # 色相設定
+
+# ロギング設定
+class QTextEditLogger(logging.Handler):
+    """QTextEditにログを出力するためのハンドラー"""
+    def __init__(self, widget):
+        super().__init__()
+        self.widget = widget
+        self.widget.setReadOnly(True)
+        self.widget.setFont(QFont("Monospace", 9))
+        
+        # フォーマットの設定
+        formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', 
+                                      datefmt='%H:%M:%S')
+        self.setFormatter(formatter)
+        
+        # エラーメッセージの色を設定
+        self.level_colors = {
+            logging.DEBUG: "gray",
+            logging.INFO: "black",
+            logging.WARNING: "orange",
+            logging.ERROR: "red",
+            logging.CRITICAL: "darkred"
+        }
+    
+    def emit(self, record):
+        msg = self.format(record)
+        color = self.level_colors.get(record.levelno, "black")
+        
+        # メインスレッドからの呼び出しを保証
+        self.widget.textCursor().insertHtml(
+            f'<font color="{color}">{msg}</font><br>'
+        )
+        
+        # 自動スクロール
+        self.widget.moveCursor(QTextCursor.End)
+        
+# BLEコマンドキュー項目
+class BLECommand:
+    """BLEデバイスに送信するコマンド"""
+    def __init__(self, device_key, cmd_type, value, callback=None):
+        self.device_key = device_key
+        self.cmd_type = cmd_type
+        self.value = value
+        self.callback = callback
+        self.timestamp = time.time()
+        
+    def get_command_string(self):
+        """コマンド文字列を返す"""
+        if self.cmd_type == CMD_COLOR:
+            r, g, b = self.value
+            return f"{self.cmd_type}:{r},{g},{b}"
+        else:
+            return f"{self.cmd_type}:{self.value}"
+            
+    def __str__(self):
+        return f"BLECommand({self.device_key}, {self.get_command_string()})"
+
+class BLESignals(QObject):
+    """BLEコントローラーからのシグナル"""
+    connection_status = Signal(str, bool)
+    command_status = Signal(str, bool, str)  # device_key, success, message
+    log_message = Signal(int, str)  # level, message
+    error_occurred = Signal(str)
+
+# ThreadPoolの代わりにシンプルなワーカースレッド実装を追加
+class AsyncWorker(Thread):
+    """非同期処理を実行するワーカースレッド"""
+    
+    def __init__(self, name="AsyncWorker"):
+        super().__init__(name=name, daemon=True)
+        self.queue = queue.Queue()
+        self.running = True
+        self.loop = None
+        # スレッド開始
+        self.start()
+    
+    def run(self):
+        """スレッドのメインループ"""
+        # 専用のイベントループを作成
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+        while self.running:
+            try:
+                # キューからタスクを取得
+                task, future = self.queue.get(timeout=0.1)
+                
+                try:
+                    # asyncioタスクを実行
+                    result = self.loop.run_until_complete(task)
+                    # 結果を設定
+                    future.set_result(result)
+                except Exception as e:
+                    # エラーを設定
+                    future.set_exception(e)
+                    
+                self.queue.task_done()
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"AsyncWorker error: {str(e)}")
+                
+        # 終了時にループをクローズ
+        if self.loop and not self.loop.is_closed():
+            self.loop.close()
+    
+    def stop(self):
+        """ワーカーを停止"""
+        self.running = False
+        self.join(timeout=1.0)
+    
+    def run_coroutine(self, coro):
+        """コルーチンを実行して結果を返す"""
+        future = concurrent.futures.Future()
+        self.queue.put((coro, future))
+        return future
+
+# スレッド固有のイベントループを管理する簡易な機能
+class BLEIOThread(Thread):
+    """BLE通信専用スレッド"""
+    
+    def __init__(self):
+        super().__init__(daemon=True, name="BLE-IO-Thread")
+        self.tasks = queue.Queue()
+        self.loop = None
+        self.running = True
+        self.start()
+    
+    def run(self):
+        """スレッドのメインループ"""
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        
+        while self.running:
+            try:
+                # タスクを取得
+                coro, future = self.tasks.get(timeout=0.1)
+                
+                try:
+                    # コルーチンを実行
+                    result = self.loop.run_until_complete(coro)
+                    # 結果を設定
+                    future.set_result(result)
+                except Exception as e:
+                    # エラーを設定
+                    future.set_exception(e)
+                
+                self.tasks.task_done()
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"BLEIOThread error: {e}")
+        
+        # 終了時の処理
+        if self.loop and not self.loop.is_closed():
+            self.loop.close()
+    
+    def execute(self, coro):
+        """コルーチンを実行して結果を返す"""
+        future = concurrent.futures.Future()
+        self.tasks.put((coro, future))
+        return future
+    
+    def stop(self):
+        """スレッドを停止"""
+        self.running = False
+        self.join(timeout=1.0)
+
+class BLEController(QObject):
+    """BLEデバイスとの通信を管理するコントローラー"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # デバイス管理
+        self.clients = {
+            "LEFT": None,
+            "RIGHT": None
+        }
+        self.connected = {
+            "LEFT": False,
+            "RIGHT": False
+        }
+        self.device_addresses = {
+            "LEFT": None,
+            "RIGHT": None
+        }
+        
+        # スレッド管理
+        self.command_queue = queue.Queue()
+        self.queue_processing = False
+        self.stop_event = Event()
+        
+        # BLE IO専用スレッド
+        self.io_thread = BLEIOThread()
+        
+        # 同期オブジェクト
+        self.lock = Lock()
+        self.signals = BLESignals()
+        
+        # 通信タイムアウト設定（秒）
+        self.command_timeout = 5.0  
+        
+        # コマンド送信間隔（秒）
+        self.command_interval = 0.1  
+    
+    def start_queue_processor(self):
+        """コマンドキュー処理スレッドを開始"""
+        if not self.queue_processing:
+            self.queue_processing = True
+            self.stop_event.clear()
+            Thread(target=self._process_command_queue, daemon=True, 
+                  name="CommandQueueProcessor").start()
+    
+    def stop_queue_processor(self):
+        """コマンドキュー処理スレッドを停止"""
+        self.stop_event.set()
+        self.queue_processing = False
+    
+    def _log(self, level, message):
+        """ログメッセージを発行"""
+        self.signals.log_message.emit(level, message)
+        
+    def _process_command_queue(self):
+        """コマンドキューを処理するスレッド関数"""
+        self._log(logging.INFO, "コマンドキュー処理を開始しました")
+        
+        while not self.stop_event.is_set():
+            try:
+                # キューからコマンドを取得（タイムアウト付き）
+                try:
+                    command = self.command_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                
+                # コマンドの処理
+                device_key = command.device_key
+                
+                # 対象デバイスの接続状態をチェック
+                if not self.connected.get(device_key, False):
+                    self._log(logging.WARNING, f"{device_key}デバイスは接続されていません。コマンドをスキップします: {command}")
+                    if command.callback:
+                        command.callback(False)
+                    self.command_queue.task_done()
+                    continue
+                
+                # BLEコマンドを実行
+                success = self._execute_ble_command(command)
+                
+                # コールバックがあれば呼び出し
+                if command.callback:
+                    command.callback(success)
+                
+                self.command_queue.task_done()
+                
+                # 連続送信による過負荷を防ぐための短いスリープ
+                time.sleep(self.command_interval)  # 設定可能な間隔を使用
+                
+            except Exception as e:
+                self._log(logging.ERROR, f"コマンドキュー処理中にエラーが発生しました: {str(e)}")
+                continue
+                
+        self._log(logging.INFO, "コマンドキュー処理を終了しました")
+    
+    def _execute_ble_command(self, command):
+        """BLEコマンドを実行"""
+        device_key = command.device_key
+        command_str = command.get_command_string()
+        
+        try:
+            # デバイス取得（スレッドセーフに）
+            client = None
+            with self.lock:
+                client = self.clients.get(device_key)
+                if not client or not self.connected.get(device_key, False):
+                    self._log(logging.WARNING, f"{device_key}デバイスは接続されていません")
+                    return False
+            
+            # 送信処理
+            async def send_command():
+                try:
+                    self._log(logging.DEBUG, f"{device_key}デバイスにコマンド送信開始: {command_str}")
+                    await client.write_gatt_char(CHARACTERISTIC_UUID, command_str.encode())
+                    self._log(logging.DEBUG, f"{device_key}デバイスにコマンド送信完了: {command_str}")
+                    return True
+                except Exception as e:
+                    self._log(logging.ERROR, f"{device_key}デバイスへのコマンド送信エラー: {str(e)}")
+                    return False
+            
+            # IO専用スレッドで実行
+            future = self.io_thread.execute(send_command())
+            
+            try:
+                # タイムアウト付きで結果を待機
+                result = future.result(timeout=self.command_timeout)
+                
+                if result:
+                    self._log(logging.INFO, f"{device_key}デバイスにコマンド送信: {command_str}")
+                    self.signals.command_status.emit(device_key, True, f"コマンド送信成功: {command_str}")
+                    return True
+                else:
+                    self.signals.command_status.emit(device_key, False, f"コマンド送信失敗: {command_str}")
+                    return False
+            except concurrent.futures.TimeoutError:
+                self._log(logging.ERROR, f"{device_key}デバイスへのコマンド送信がタイムアウトしました: {command_str}")
+                self.signals.command_status.emit(device_key, False, f"コマンド送信タイムアウト: {command_str}")
+                self._update_connection_status(device_key, False)
+                return False
+        except Exception as e:
+            self._log(logging.ERROR, f"{device_key}デバイスへのコマンド送信に失敗: {str(e)}")
+            self.signals.command_status.emit(device_key, False, f"コマンド送信エラー: {str(e)}")
+            return False
+    
+    def _update_connection_status(self, device_key, connected):
+        """接続状態を更新"""
+        with self.lock:
+            self.connected[device_key] = connected
+            self.signals.connection_status.emit(device_key, connected)
+    
+    def scan_and_connect(self, device_key):
+        """デバイスをスキャンして接続"""
+        device_name = DEVICE_NAMES.get(device_key)
+        if not device_name:
+            self._log(logging.ERROR, f"不明なデバイスキー: {device_key}")
+            return False
+        
+        self._log(logging.INFO, f"{device_key} ({device_name})デバイスを探しています...")
+        future = concurrent.futures.Future()
+        
+        # 接続処理
+        async def scan_and_connect_async():
+            try:
+                # デバイススキャン
+                devices = await BleakScanner.discover(timeout=5.0)
+                
+                target_device = None
+                for device in devices:
+                    if device.name == device_name:
+                        self._log(logging.INFO, f"デバイスが見つかりました: {device.name} ({device.address})")
+                        target_device = device
+                        break
+                
+                if not target_device:
+                    self._log(logging.WARNING, f"{device_key}デバイスが見つかりませんでした")
+                    return False
+                
+                # アドレスを保存
+                self.device_addresses[device_key] = target_device.address
+                
+                # 接続
+                client = BleakClient(target_device.address)
+                await client.connect()
+                
+                if client.is_connected:
+                    with self.lock:
+                        self.clients[device_key] = client
+                        self.connected[device_key] = True
+                    
+                    self._log(logging.INFO, f"{device_key}デバイスに接続しました")
+                    self._update_connection_status(device_key, True)
+                    return True
+                else:
+                    self._log(logging.WARNING, f"{device_key}デバイスに接続できませんでした")
+                    return False
+            except Exception as e:
+                self._log(logging.ERROR, f"{device_key}デバイスへの接続中にエラーが発生: {str(e)}")
+                return False
+        
+        # IO専用スレッドで実行
+        io_future = self.io_thread.execute(scan_and_connect_async())
+        
+        # 完了コールバック
+        def on_done(f):
+            try:
+                result = f.result()
+                future.set_result(result)
+            except Exception as e:
+                self._log(logging.ERROR, f"接続処理中にエラーが発生: {str(e)}")
+                self._update_connection_status(device_key, False)
+                future.set_exception(e)
+        
+        io_future.add_done_callback(on_done)
+        return future
+    
+    def disconnect(self, device_key):
+        """デバイスを切断"""
+        future = concurrent.futures.Future()
+        
+        with self.lock:
+            if not self.clients.get(device_key) or not self.connected.get(device_key, False):
+                self._log(logging.WARNING, f"{device_key}デバイスは接続されていません")
+                future.set_result(False)
+                return future
+        
+        client = self.clients.get(device_key)
+        
+        # 切断処理
+        async def disconnect_async():
+            try:
+                await client.disconnect()
+                return True
+            except Exception as e:
+                self._log(logging.ERROR, f"{device_key}デバイスの切断中にエラーが発生: {str(e)}")
+                return False
+        
+        # IO専用スレッドで実行
+        io_future = self.io_thread.execute(disconnect_async())
+        
+        # 完了コールバック
+        def on_done(f):
+            try:
+                result = f.result()
+                
+                # 接続状態を更新
+                with self.lock:
+                    self.clients[device_key] = None
+                    self.connected[device_key] = False
+                
+                self._log(logging.INFO, f"{device_key}デバイスを切断しました")
+                self._update_connection_status(device_key, False)
+                future.set_result(result)
+            except Exception as e:
+                self._log(logging.ERROR, f"{device_key}デバイスの切断処理でエラー: {str(e)}")
+                
+                # エラーが発生しても接続状態をリセット
+                with self.lock:
+                    self.clients[device_key] = None
+                    self.connected[device_key] = False
+                
+                self._update_connection_status(device_key, False)
+                future.set_exception(e)
+        
+        io_future.add_done_callback(on_done)
+        return future
+
+    def enqueue_command(self, device_key, cmd_type, value, callback=None):
+        """コマンドをキューに追加"""
+        command = BLECommand(device_key, cmd_type, value, callback)
+        self._log(logging.DEBUG, f"コマンドをキューに追加: {command}")
+        self.command_queue.put(command)
+        
+        # コマンドキュー処理が動いていなければ開始
+        if not self.queue_processing:
+            self.start_queue_processor()
+    
+    def set_rgb_color(self, device_key, r, g, b, callback=None):
+        """RGB値で色を設定"""
+        self.enqueue_command(device_key, CMD_COLOR, (r, g, b), callback)
+    
+    def set_mode(self, device_key, auto_mode, callback=None):
+        """モードを設定 (0=固定色, 1=自動色相変化)"""
+        mode_value = 1 if auto_mode else 0
+        self.enqueue_command(device_key, CMD_MODE, mode_value, callback)
+    
+    def set_hue(self, device_key, hue, callback=None):
+        """色相を設定 (0-255)"""
+        self.enqueue_command(device_key, CMD_HUE, hue, callback)
+    
+    def apply_settings(self, device_key, auto_mode, r=0, g=0, b=0, hue=0, callback=None):
+        """設定を適用"""
+        if auto_mode:
+            # 自動モードの場合は、モード設定のみ行う（H:コマンドは送信しない）
+            self.set_mode(device_key, auto_mode, callback)
+        else:
+            # 固定色モードの場合は、M:0は送らずに直接色だけを設定
+            self.set_rgb_color(device_key, r, g, b, callback)
+    
+    def apply_settings_to_both(self, auto_mode, r=0, g=0, b=0, hue=0, callback=None):
+        """両方のデバイスに設定を適用"""
+        success_count = [0]
+        total_needed = 2
+        
+        def on_device_complete(success):
+            if success:
+                success_count[0] += 1
+            
+            if success_count[0] >= total_needed or not success:
+                if callback:
+                    callback(success_count[0] >= total_needed)
+        
+        # 両方のデバイスに設定を適用
+        for device_key in ["LEFT", "RIGHT"]:
+            if self.connected.get(device_key, False):
+                self.apply_settings(device_key, auto_mode, r, g, b, hue, on_device_complete)
+            else:
+                # 接続されていないデバイスはスキップ
+                total_needed -= 1
+        
+        # 接続されているデバイスがない場合
+        if total_needed == 0 and callback:
+            callback(False)
+    
+    def cleanup(self):
+        """リソースをクリーンアップ"""
+        self.stop_queue_processor()
+        
+        # IO専用スレッドを停止
+        if hasattr(self, 'io_thread'):
+            self.io_thread.stop()
+
+class ColorPreviewWidget(QWidget):
+    """色のプレビューを表示するウィジェット"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.color = QColor(255, 255, 255)
+        self.setMinimumSize(100, 50)
+        
+    def setColor(self, color):
+        self.color = color
+        self.update()
+        
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setBrush(QBrush(self.color))
+        painter.drawRect(0, 0, self.width(), self.height())
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+        self.current_color = QColor(255, 255, 255)
+        self.current_hue = 0
+        self.auto_mode = False
+        
+        # BLEコントローラーの初期化
+        self.ble_controller = BLEController()
+        self.ble_controller.signals.connection_status.connect(self.update_connection_status)
+        self.ble_controller.signals.command_status.connect(self.update_command_status)
+        self.ble_controller.signals.log_message.connect(self.log_message)
+        self.ble_controller.signals.error_occurred.connect(self.show_error)
+        
+        # コマンドキュー処理を開始
+        self.ble_controller.start_queue_processor()
+        
+        # UI初期化
+        self.init_ui()
+        
+        # ロギング設定
+        self.logger = logging.getLogger("sirius3")
+        self.logger.setLevel(logging.DEBUG)
+        
+        # コンソールハンドラー
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(formatter)
+        self.logger.addHandler(console_handler)
+        
+        # QTextEditハンドラー
+        text_handler = QTextEditLogger(self.log_text)
+        text_handler.setLevel(logging.INFO)
+        self.logger.addHandler(text_handler)
+        
+        self.logger.info("シリウス3 LEDコントローラーを起動しました")
+    
+    def init_ui(self):
+        self.setWindowTitle("Sirius3 LED Controller")
+        self.setMinimumSize(800, 600)
+        
+        # メインレイアウト（上下分割）
+        main_splitter = QSplitter(Qt.Vertical)
+        
+        # 上部ウィジェット（コントロール部分）
+        top_widget = QWidget()
+        top_layout = QVBoxLayout(top_widget)
+        
+        # デバイス接続部分
+        connection_group = QGroupBox("デバイス接続")
+        connection_layout = QHBoxLayout()
+        
+        # LEFT EAR接続
+        left_layout = QVBoxLayout()
+        self.left_connect_btn = QPushButton("LEFT EAR 接続")
+        self.left_connect_btn.setMinimumHeight(40)
+        self.left_status_label = QLabel("未接続")
+        self.left_status_label.setStyleSheet("color: red; font-weight: bold;")
+        self.left_connect_btn.clicked.connect(lambda: self.connect_device("LEFT"))
+        left_layout.addWidget(self.left_connect_btn)
+        left_layout.addWidget(self.left_status_label)
+        
+        # RIGHT EAR接続
+        right_layout = QVBoxLayout()
+        self.right_connect_btn = QPushButton("RIGHT EAR 接続")
+        self.right_connect_btn.setMinimumHeight(40)
+        self.right_status_label = QLabel("未接続")
+        self.right_status_label.setStyleSheet("color: red; font-weight: bold;")
+        self.right_connect_btn.clicked.connect(lambda: self.connect_device("RIGHT"))
+        right_layout.addWidget(self.right_connect_btn)
+        right_layout.addWidget(self.right_status_label)
+        
+        connection_layout.addLayout(left_layout)
+        connection_layout.addLayout(right_layout)
+        connection_group.setLayout(connection_layout)
+        top_layout.addWidget(connection_group)
+        
+        # カラー設定部分
+        color_group = QGroupBox("カラー設定")
+        color_layout = QVBoxLayout()
+        
+        # カラープレビュー
+        preview_layout = QHBoxLayout()
+        preview_layout.addWidget(QLabel("現在の色:"))
+        self.color_preview = ColorPreviewWidget()
+        self.color_preview.setMinimumHeight(60)
+        preview_layout.addWidget(self.color_preview)
+        color_layout.addLayout(preview_layout)
+        
+        # カラーピッカーボタン
+        color_btn_layout = QHBoxLayout()
+        self.color_picker_btn = QPushButton("カラーピッカー")
+        self.color_picker_btn.setMinimumHeight(30)
+        self.color_picker_btn.clicked.connect(self.show_color_picker)
+        color_btn_layout.addWidget(self.color_picker_btn)
+        color_layout.addLayout(color_btn_layout)
+        
+        # 色相スライダー
+        hue_layout = QHBoxLayout()
+        hue_layout.addWidget(QLabel("色相:"))
+        self.hue_slider = QSlider(Qt.Horizontal)
+        self.hue_slider.setRange(0, 255)
+        self.hue_slider.setValue(0)
+        self.hue_slider.valueChanged.connect(self.hue_changed)
+        hue_layout.addWidget(self.hue_slider)
+        self.hue_value_label = QLabel("0")
+        self.hue_value_label.setMinimumWidth(30)
+        hue_layout.addWidget(self.hue_value_label)
+        color_layout.addLayout(hue_layout)
+        
+        # 動作モード
+        mode_layout = QHBoxLayout()
+        self.auto_mode_check = QCheckBox("自動色相変化モード")
+        self.auto_mode_check.stateChanged.connect(self.mode_changed)
+        mode_layout.addWidget(self.auto_mode_check)
+        color_layout.addLayout(mode_layout)
+        
+        color_group.setLayout(color_layout)
+        top_layout.addWidget(color_group)
+        
+        # 適用ボタン
+        apply_group = QGroupBox("設定適用")
+        apply_layout = QHBoxLayout()
+        
+        self.apply_left_btn = QPushButton("LEFT EARに適用")
+        self.apply_left_btn.setMinimumHeight(50)
+        self.apply_left_btn.clicked.connect(lambda: self.apply_settings("LEFT"))
+        self.apply_left_btn.setEnabled(False)
+        
+        self.apply_right_btn = QPushButton("RIGHT EARに適用")
+        self.apply_right_btn.setMinimumHeight(50)
+        self.apply_right_btn.clicked.connect(lambda: self.apply_settings("RIGHT"))
+        self.apply_right_btn.setEnabled(False)
+        
+        self.apply_both_btn = QPushButton("両方に適用")
+        self.apply_both_btn.setMinimumHeight(50)
+        self.apply_both_btn.setStyleSheet("font-weight: bold;")
+        self.apply_both_btn.clicked.connect(self.apply_to_both)
+        self.apply_both_btn.setEnabled(False)
+        
+        apply_layout.addWidget(self.apply_left_btn)
+        apply_layout.addWidget(self.apply_right_btn)
+        apply_layout.addWidget(self.apply_both_btn)
+        apply_group.setLayout(apply_layout)
+        top_layout.addWidget(apply_group)
+        
+        # ステータス表示
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(QLabel("ステータス:"))
+        self.status_label = QLabel("準備完了")
+        status_layout.addWidget(self.status_label)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumHeight(15)
+        self.progress_bar.setVisible(False)
+        status_layout.addWidget(self.progress_bar)
+        top_layout.addLayout(status_layout)
+        
+        # 下部ウィジェット（ログ表示）
+        bottom_widget = QWidget()
+        bottom_layout = QVBoxLayout(bottom_widget)
+        
+        log_group = QGroupBox("ログ")
+        log_layout = QVBoxLayout()
+        
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setLineWrapMode(QTextEdit.NoWrap)
+        log_layout.addWidget(self.log_text)
+        
+        log_btn_layout = QHBoxLayout()
+        self.clear_log_btn = QPushButton("ログをクリア")
+        self.clear_log_btn.clicked.connect(self.clear_log)
+        log_btn_layout.addWidget(self.clear_log_btn)
+        log_layout.addLayout(log_btn_layout)
+        
+        log_group.setLayout(log_layout)
+        bottom_layout.addWidget(log_group)
+        
+        # スプリッターに追加
+        main_splitter.addWidget(top_widget)
+        main_splitter.addWidget(bottom_widget)
+        main_splitter.setSizes([400, 200])
+        
+        self.setCentralWidget(main_splitter)
+    
+    def log_message(self, level, message):
+        """ログメッセージを記録"""
+        if level == logging.DEBUG:
+            self.logger.debug(message)
+        elif level == logging.INFO:
+            self.logger.info(message)
+        elif level == logging.WARNING:
+            self.logger.warning(message)
+        elif level == logging.ERROR:
+            self.logger.error(message)
+        elif level == logging.CRITICAL:
+            self.logger.critical(message)
+    
+    def clear_log(self):
+        """ログをクリア"""
+        self.log_text.clear()
+        self.logger.info("ログをクリアしました")
+    
+    def connect_device(self, device_key):
+        """デバイスに接続/切断"""
+        if not self.ble_controller.connected.get(device_key, False):
+            # 接続処理
+            btn = self.left_connect_btn if device_key == "LEFT" else self.right_connect_btn
+            btn.setEnabled(False)
+            btn.setText("接続中...")
+            
+            # プログレスバーを表示
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)  # 不定のプログレス表示
+            
+            # 接続処理を実行
+            future = self.ble_controller.scan_and_connect(device_key)
+            
+            # 完了時の処理
+            def on_connect_done(future):
+                self.progress_bar.setVisible(False)
+                btn.setEnabled(True)
+                
+                try:
+                    result = future.result()
+                    if not result:
+                        self.logger.warning(f"{device_key}デバイスへの接続に失敗しました")
+                except Exception as e:
+                    self.logger.error(f"接続処理中にエラーが発生: {str(e)}")
+            
+            # 完了コールバックを設定
+            future.add_done_callback(on_connect_done)
+            
+        else:
+            # 切断処理
+            self.ble_controller.disconnect(device_key)
+    
+    @Slot(str, bool)
+    def update_connection_status(self, device_key, connected):
+        """接続状態の表示を更新"""
+        if device_key == "LEFT":
+            btn = self.left_connect_btn
+            label = self.left_status_label
+            apply_btn = self.apply_left_btn
+        else:  # RIGHT
+            btn = self.right_connect_btn
+            label = self.right_status_label
+            apply_btn = self.apply_right_btn
+        
+        if connected:
+            label.setText("接続済み")
+            label.setStyleSheet("color: green; font-weight: bold;")
+            btn.setText("切断")
+            apply_btn.setEnabled(True)
+        else:
+            label.setText("未接続")
+            label.setStyleSheet("color: red; font-weight: bold;")
+            btn.setText(f"{device_key} EAR 接続")
+            apply_btn.setEnabled(False)
+        
+        btn.setEnabled(True)
+        
+        # 両方に適用ボタンの状態を更新
+        self.apply_both_btn.setEnabled(
+            self.ble_controller.connected.get("LEFT", False) and 
+            self.ble_controller.connected.get("RIGHT", False)
+        )
+    
+    @Slot(str, bool, str)
+    def update_command_status(self, device_key, success, message):
+        """コマンド実行状態を更新"""
+        if success:
+            self.status_label.setText(f"{device_key}: {message}")
+            self.status_label.setStyleSheet("color: green;")
+        else:
+            self.status_label.setText(f"{device_key}: {message}")
+            self.status_label.setStyleSheet("color: red;")
+    
+    @Slot(str)
+    def show_error(self, message):
+        """エラーメッセージを表示"""
+        QMessageBox.critical(self, "エラー", message)
+    
+    def show_color_picker(self):
+        """カラーピッカーダイアログを表示"""
+        color = QColorDialog.getColor(self.current_color, self, "色を選択")
+        if color.isValid():
+            self.current_color = color
+            self.color_preview.setColor(color)
+            self.auto_mode_check.setChecked(False)  # 色を選択したら自動モードをオフ
+    
+    def hue_changed(self, value):
+        """色相スライダーの値が変更されたときの処理"""
+        self.current_hue = value
+        self.hue_value_label.setText(str(value))
+        
+        # 色相に基づいてプレビューの色を更新（HSVからRGB変換）
+        h = value / 255.0
+        s = 1.0
+        v = 1.0
+        
+        if s == 0.0:
+            r = g = b = v
+        else:
+            h *= 6.0
+            i = int(h)
+            f = h - i
+            p = v * (1.0 - s)
+            q = v * (1.0 - s * f)
+            t = v * (1.0 - s * (1.0 - f))
+            
+            if i == 0:
+                r, g, b = v, t, p
+            elif i == 1:
+                r, g, b = q, v, p
+            elif i == 2:
+                r, g, b = p, v, t
+            elif i == 3:
+                r, g, b = p, q, v
+            elif i == 4:
+                r, g, b = t, p, v
+            else:
+                r, g, b = v, p, q
+        
+        self.current_color = QColor(
+            int(r * 255),
+            int(g * 255),
+            int(b * 255)
+        )
+        self.color_preview.setColor(self.current_color)
+    
+    def mode_changed(self, state):
+        """動作モードが変更されたときの処理"""
+        self.auto_mode = (state == Qt.Checked)
+        # モード変更時にプレビュー表示を更新
+        if self.auto_mode:
+            # 自動モードの場合は現在の色相を使用
+            self.hue_changed(self.current_hue)
+    
+    def apply_settings(self, device_key):
+        """設定をデバイスに適用"""
+        if not self.ble_controller.connected.get(device_key, False):
+            self.logger.warning(f"{device_key}デバイスは接続されていません")
+            return
+        
+        # ボタンを一時的に無効化
+        btn = self.apply_left_btn if device_key == "LEFT" else self.apply_right_btn
+        btn.setEnabled(False)
+        
+        # ステータス表示
+        self.status_label.setText(f"{device_key}デバイスに設定を適用中...")
+        self.status_label.setStyleSheet("color: blue;")
+        
+        # プログレスバーを表示
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # 不定のプログレス表示
+        
+        # 自動モードかどうか
+        auto_mode = self.auto_mode_check.isChecked()
+        
+        # 色の値を取得
+        r, g, b = self.current_color.red(), self.current_color.green(), self.current_color.blue()
+        
+        # 現在の色相値を取得
+        hue = self.current_hue
+        
+        # 設定適用
+        def on_apply_complete(success):
+            btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+            
+            if success:
+                mode_text = "自動色相変化" if auto_mode else "固定色"
+                self.status_label.setText(f"{device_key}デバイスに設定を適用しました（{mode_text}モード）")
+                self.status_label.setStyleSheet("color: green;")
+            else:
+                self.status_label.setText(f"{device_key}デバイスへの設定適用に失敗しました")
+                self.status_label.setStyleSheet("color: red;")
+        
+        # 色相値も含めて設定を適用
+        self.ble_controller.apply_settings(device_key, auto_mode, r, g, b, hue, on_apply_complete)
+    
+    def apply_to_both(self):
+        """両方のデバイスに設定を適用"""
+        if not (self.ble_controller.connected.get("LEFT", False) and self.ble_controller.connected.get("RIGHT", False)):
+            self.logger.warning("両方のデバイスが接続されていません")
+            return
+        
+        # ボタンを一時的に無効化
+        self.apply_both_btn.setEnabled(False)
+        
+        # ステータス表示
+        self.status_label.setText("両方のデバイスに設定を適用中...")
+        self.status_label.setStyleSheet("color: blue;")
+        
+        # プログレスバーを表示
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # 不定のプログレス表示
+        
+        # 自動モードかどうか
+        auto_mode = self.auto_mode_check.isChecked()
+        
+        # 色の値を取得
+        r, g, b = self.current_color.red(), self.current_color.green(), self.current_color.blue()
+        
+        # 現在の色相値を取得
+        hue = self.current_hue
+        
+        # 設定適用
+        def on_both_complete(success):
+            self.apply_both_btn.setEnabled(
+                self.ble_controller.connected.get("LEFT", False) and 
+                self.ble_controller.connected.get("RIGHT", False)
+            )
+            self.progress_bar.setVisible(False)
+            
+            if success:
+                mode_text = "自動色相変化" if auto_mode else "固定色"
+                self.status_label.setText(f"両方のデバイスに設定を適用しました（{mode_text}モード）")
+                self.status_label.setStyleSheet("color: green;")
+            else:
+                self.status_label.setText("設定適用に一部失敗しました")
+                self.status_label.setStyleSheet("color: orange;")
+        
+        # 色相値も含めて設定を適用
+        self.ble_controller.apply_settings_to_both(auto_mode, r, g, b, hue, on_both_complete)
+    
+    def closeEvent(self, event):
+        """アプリケーション終了時の処理"""
+        self.logger.info("アプリケーションを終了します")
+        
+        # リソース解放
+        self.ble_controller.cleanup()
+        
+        # 各デバイスの切断処理
+        for device_key in ["LEFT", "RIGHT"]:
+            if self.ble_controller.connected.get(device_key, False):
+                try:
+                    future = self.ble_controller.disconnect(device_key)
+                    # 切断処理が完了するのを少し待つ
+                    future.result(timeout=1.0)
+                except:
+                    pass
+        
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
