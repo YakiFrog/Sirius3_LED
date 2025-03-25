@@ -501,28 +501,114 @@ class BLEController(QObject):
     
     def apply_settings_to_both(self, auto_mode, r=0, g=0, b=0, hue=0, callback=None):
         """両方のデバイスに設定を適用"""
-        success_count = [0]
-        total_needed = 2
-        
-        def on_device_complete(success):
-            if success:
-                success_count[0] += 1
-            
-            if success_count[0] >= total_needed or not success:
-                if callback:
-                    callback(success_count[0] >= total_needed)
-        
-        # 両方のデバイスに設定を適用
+        # 接続済みのデバイスを確認
+        connected_devices = []
         for device_key in ["LEFT", "RIGHT"]:
             if self.connected.get(device_key, False):
-                self.apply_settings(device_key, auto_mode, r, g, b, hue, on_device_complete)
-            else:
-                # 接続されていないデバイスはスキップ
-                total_needed -= 1
+                connected_devices.append(device_key)
         
-        # 接続されているデバイスがない場合
-        if total_needed == 0 and callback:
-            callback(False)
+        if not connected_devices:
+            self._log(logging.WARNING, "接続されているデバイスがありません")
+            if callback:
+                callback(False)
+            return
+        
+        if auto_mode:
+            # 同時にモード変更コマンドを送信
+            commands = []
+            for device_key in connected_devices:
+                commands.append((device_key, CMD_MODE, 1))
+            
+            self._send_commands_simultaneously(commands, callback)
+        else:
+            # 同時に色設定コマンドを送信
+            commands = []
+            for device_key in connected_devices:
+                commands.append((device_key, CMD_COLOR, (r, g, b)))
+            
+            self._send_commands_simultaneously(commands, callback)
+    
+    def _send_commands_simultaneously(self, commands, callback=None):
+        """複数のコマンドをできるだけ同時に送信"""
+        if not commands:
+            if callback:
+                callback(True)
+            return
+        
+        # 同時実行するために全てのコマンドを先に準備
+        prepared_commands = []
+        command_strs = []
+        
+        for device_key, cmd_type, value in commands:
+            try:
+                # デバイス取得（スレッドセーフに）
+                with self.lock:
+                    client = self.clients.get(device_key)
+                    if not client or not self.connected.get(device_key, False):
+                        self._log(logging.WARNING, f"{device_key}デバイスは接続されていません")
+                        continue
+                
+                # コマンド文字列を生成
+                if cmd_type == CMD_COLOR:
+                    r, g, b = value
+                    command_str = f"{cmd_type}:{r},{g},{b}"
+                else:
+                    command_str = f"{cmd_type}:{value}"
+                
+                prepared_commands.append((device_key, client, command_str))
+                command_strs.append(f"{device_key}:{command_str}")
+                
+            except Exception as e:
+                self._log(logging.ERROR, f"{device_key}デバイスのコマンド準備に失敗: {str(e)}")
+        
+        if not prepared_commands:
+            if callback:
+                callback(False)
+            return
+        
+        self._log(logging.INFO, f"同時コマンド送信: {', '.join(command_strs)}")
+        
+        # 全てのコマンドを同時に送信するコルーチン
+        async def send_all_commands():
+            tasks = []
+            for device_key, client, command_str in prepared_commands:
+                # 各デバイスごとにタスクを作成
+                task = asyncio.create_task(self._async_send_command(device_key, client, command_str))
+                tasks.append(task)
+            
+            # 全てのタスクが完了するのを待機
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # 結果を確認
+            success = all(isinstance(r, bool) and r for r in results)
+            return success
+        
+        # IO専用スレッドで一括実行
+        future = self.io_thread.execute(send_all_commands())
+        
+        # 完了コールバック
+        def on_done(f):
+            try:
+                result = f.result()
+                if callback:
+                    callback(result)
+            except Exception as e:
+                self._log(logging.ERROR, f"同時コマンド送信でエラーが発生: {str(e)}")
+                if callback:
+                    callback(False)
+        
+        future.add_done_callback(on_done)
+    
+    async def _async_send_command(self, device_key, client, command_str):
+        """単一コマンドを非同期で送信"""
+        try:
+            self._log(logging.DEBUG, f"{device_key}デバイスにコマンド送信開始: {command_str}")
+            await client.write_gatt_char(CHARACTERISTIC_UUID, command_str.encode())
+            self._log(logging.DEBUG, f"{device_key}デバイスにコマンド送信完了: {command_str}")
+            return True
+        except Exception as e:
+            self._log(logging.ERROR, f"{device_key}デバイスへのコマンド送信エラー: {str(e)}")
+            return False
     
     def cleanup(self):
         """リソースをクリーンアップ"""
