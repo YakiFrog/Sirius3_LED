@@ -409,7 +409,7 @@ class BLEController(QObject):
         async def scan_and_connect_async():
             try:
                 # デバイススキャン
-                devices = await BleakScanner.discover(timeout=5.0)
+                devices = await BleakScanner.discover(timeout=2.0)
                 
                 target_device = None
                 for device in devices:
@@ -427,7 +427,8 @@ class BLEController(QObject):
                 
                 # 接続
                 client = BleakClient(target_device.address)
-                await client.connect()
+                # await client.connect()
+                await client.connect(timeout=2.0, services=[SERVICE_UUID])
                 
                 if client.is_connected:
                     with self.lock:
@@ -1183,7 +1184,19 @@ class MainWindow(QMainWindow):
         
         # デバイス接続部分
         connection_group = QGroupBox("デバイス接続")
-        connection_layout = QHBoxLayout()
+        connection_layout = QVBoxLayout()  # 変更: 縦レイアウトに変更して両方接続ボタンを追加
+        
+        # 両方同時接続ボタン
+        both_connect_layout = QHBoxLayout()
+        self.both_connect_btn = QPushButton("両方同時に接続")
+        self.both_connect_btn.setMinimumHeight(40)
+        self.both_connect_btn.setStyleSheet("font-weight: bold;")
+        self.both_connect_btn.clicked.connect(self.connect_both_devices)
+        both_connect_layout.addWidget(self.both_connect_btn)
+        connection_layout.addLayout(both_connect_layout)
+        
+        # 個別接続ボタン
+        individual_connect_layout = QHBoxLayout()
         
         # LEFT EAR接続
         left_layout = QVBoxLayout()
@@ -1205,8 +1218,10 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.right_connect_btn)
         right_layout.addWidget(self.right_status_label)
         
-        connection_layout.addLayout(left_layout)
-        connection_layout.addLayout(right_layout)
+        individual_connect_layout.addLayout(left_layout)
+        individual_connect_layout.addLayout(right_layout)
+        connection_layout.addLayout(individual_connect_layout)
+        
         connection_group.setLayout(connection_layout)
         top_layout.addWidget(connection_group)
         
@@ -1909,6 +1924,81 @@ class MainWindow(QMainWindow):
     def update_transition_time_label(self, value):
         """遷移時間ラベルを更新"""
         self.transition_time_label.setText(f"{value} ms")
+
+    def connect_both_devices(self):
+        """両方のデバイスを同時に接続"""
+        # 既に接続されているデバイスをチェック
+        left_connected = self.ble_controller.connected.get("LEFT", False)
+        right_connected = self.ble_controller.connected.get("RIGHT", False)
+        
+        if left_connected and right_connected:
+            # 両方とも接続済みなら切断
+            self.logger.info("両方のデバイスを切断します")
+            self.ble_controller.disconnect("LEFT")
+            self.ble_controller.disconnect("RIGHT")
+            return
+        
+        # ボタンを無効化して接続中表示
+        self.both_connect_btn.setEnabled(False)
+        self.both_connect_btn.setText("接続中...")
+        self.left_connect_btn.setEnabled(False)
+        self.right_connect_btn.setEnabled(False)
+        
+        # プログレスバーを表示
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # 不定のプログレス表示
+        
+        self.logger.info("両方のデバイスの接続を開始します")
+        
+        # 未接続のデバイスを接続
+        connect_tasks = []
+        
+        if not left_connected:
+            left_future = self.ble_controller.scan_and_connect("LEFT")
+            connect_tasks.append(left_future)
+        
+        if not right_connected:
+            right_future = self.ble_controller.scan_and_connect("RIGHT")
+            connect_tasks.append(right_future)
+        
+        # 接続完了時の処理
+        def on_all_connect_done():
+            self.both_connect_btn.setEnabled(True)
+            self.both_connect_btn.setText("両方同時に接続")
+            self.left_connect_btn.setEnabled(True)
+            self.right_connect_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+            
+            # 接続結果確認
+            left_success = self.ble_controller.connected.get("LEFT", False)
+            right_success = self.ble_controller.connected.get("RIGHT", False)
+            
+            if left_success and right_success:
+                self.logger.info("両方のデバイスの接続に成功しました")
+                self.both_connect_btn.setText("両方切断")
+            elif left_success:
+                self.logger.warning("LEFT EARのみ接続しました。RIGHT EARの接続に失敗しました")
+            elif right_success:
+                self.logger.warning("RIGHT EARのみ接続しました。LEFT EARの接続に失敗しました")
+            else:
+                self.logger.error("両方のデバイスの接続に失敗しました")
+        
+        # すべてのタスクが完了したら通知
+        pending_count = len(connect_tasks)
+        
+        def on_connect_done(future):
+            nonlocal pending_count
+            pending_count -= 1
+            if pending_count <= 0:
+                on_all_connect_done()
+        
+        # コールバックを設定
+        for future in connect_tasks:
+            future.add_done_callback(on_connect_done)
+        
+        # タスクがない場合（既に両方接続されている場合など）
+        if not connect_tasks:
+            on_all_connect_done()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
