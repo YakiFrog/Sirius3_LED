@@ -1123,6 +1123,34 @@ class AudioProcessor(QObject):
             self.p.terminate()
             self.p = None
 
+class ColorPreviewButton(QPushButton):
+    """色のプレビューと選択ができるボタン"""
+    color_changed = Signal(QColor)
+    
+    def __init__(self, color=QColor(255, 255, 255), parent=None):
+        super().__init__(parent)
+        self.color = color
+        self.setMinimumSize(30, 30)
+        self.setMaximumSize(50, 30)
+        self.clicked.connect(self.select_color)
+        
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setPen(Qt.black)
+        painter.setBrush(QBrush(self.color))
+        painter.drawRect(5, 5, self.width() - 10, self.height() - 10)
+        
+    def select_color(self):
+        color = QColorDialog.getColor(self.color, self, "色を選択")
+        if color.isValid():
+            self.set_color(color)
+            self.color_changed.emit(color)
+    
+    def set_color(self, color):
+        self.color = color
+        self.update()
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1182,18 +1210,25 @@ class MainWindow(QMainWindow):
     
     def init_ui(self):
         self.setWindowTitle("Sirius3 LED Controller")
-        self.setMinimumSize(800, 900)
+        self.setMinimumSize(1200, 800)  # ウィンドウサイズを大きくする
         
-        # メインレイアウト（上下分割）
-        main_splitter = QSplitter(Qt.Vertical)
+        # メインウィジェットとレイアウト（左右分割）
+        main_widget = QWidget()
+        main_layout = QHBoxLayout(main_widget)
         
-        # 上部ウィジェット（コントロール部分）
-        top_widget = QWidget()
-        top_layout = QVBoxLayout(top_widget)
+        # 左ペイン（基本設定）
+        left_pane = QWidget()
+        left_layout = QVBoxLayout(left_pane)
+        
+        # 右ペイン（アニメーション制御とログ）
+        right_pane = QWidget()
+        right_layout = QVBoxLayout(right_pane)
+        
+        # ===== 左ペインのコンテンツ =====
         
         # デバイス接続部分
         connection_group = QGroupBox("デバイス接続")
-        connection_layout = QVBoxLayout()  # 変更: 縦レイアウトに変更して両方接続ボタンを追加
+        connection_layout = QVBoxLayout()
         
         # 両方同時接続ボタン
         both_connect_layout = QHBoxLayout()
@@ -1208,31 +1243,31 @@ class MainWindow(QMainWindow):
         individual_connect_layout = QHBoxLayout()
         
         # LEFT EAR接続
-        left_layout = QVBoxLayout()
+        left_layout_conn = QVBoxLayout()
         self.left_connect_btn = QPushButton("LEFT EAR 接続")
         self.left_connect_btn.setMinimumHeight(40)
         self.left_status_label = QLabel("未接続")
         self.left_status_label.setStyleSheet("color: red; font-weight: bold;")
         self.left_connect_btn.clicked.connect(lambda: self.connect_device("LEFT"))
-        left_layout.addWidget(self.left_connect_btn)
-        left_layout.addWidget(self.left_status_label)
+        left_layout_conn.addWidget(self.left_connect_btn)
+        left_layout_conn.addWidget(self.left_status_label)
         
         # RIGHT EAR接続
-        right_layout = QVBoxLayout()
+        right_layout_conn = QVBoxLayout()
         self.right_connect_btn = QPushButton("RIGHT EAR 接続")
         self.right_connect_btn.setMinimumHeight(40)
         self.right_status_label = QLabel("未接続")
         self.right_status_label.setStyleSheet("color: red; font-weight: bold;")
         self.right_connect_btn.clicked.connect(lambda: self.connect_device("RIGHT"))
-        right_layout.addWidget(self.right_connect_btn)
-        right_layout.addWidget(self.right_status_label)
+        right_layout_conn.addWidget(self.right_connect_btn)
+        right_layout_conn.addWidget(self.right_status_label)
         
-        individual_connect_layout.addLayout(left_layout)
-        individual_connect_layout.addLayout(right_layout)
+        individual_connect_layout.addLayout(left_layout_conn)
+        individual_connect_layout.addLayout(right_layout_conn)
         connection_layout.addLayout(individual_connect_layout)
         
         connection_group.setLayout(connection_layout)
-        top_layout.addWidget(connection_group)
+        left_layout.addWidget(connection_group)
         
         # カラー設定部分
         color_group = QGroupBox("カラー設定")
@@ -1321,7 +1356,7 @@ class MainWindow(QMainWindow):
         self.auto_mode_check.setVisible(False)
         
         color_group.setLayout(color_layout)
-        top_layout.addWidget(color_group)
+        left_layout.addWidget(color_group)
         
         # 色遷移設定
         transition_group = QGroupBox("色遷移設定")
@@ -1363,7 +1398,7 @@ class MainWindow(QMainWindow):
         transition_layout.addLayout(transition_btn_layout)
         transition_group.setLayout(transition_layout)
         
-        top_layout.addWidget(transition_group)
+        left_layout.addWidget(transition_group)
         
         # 適用ボタン
         apply_group = QGroupBox("設定適用")
@@ -1389,9 +1424,80 @@ class MainWindow(QMainWindow):
         apply_layout.addWidget(self.apply_both_btn)
         
         apply_group.setLayout(apply_layout)
-        top_layout.addWidget(apply_group)
+        left_layout.addWidget(apply_group)
         
-        # アニメーション制御部分（新規追加）
+        # ステータス表示
+        status_layout = QHBoxLayout()
+        self.status_label = QLabel("準備完了")
+        status_layout.addWidget(self.status_label)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        status_layout.addWidget(self.progress_bar)
+        
+        left_layout.addLayout(status_layout)
+        
+        # 左ペインに余白を追加
+        left_layout.addStretch(1)
+        
+        # ===== 右ペインのコンテンツ =====
+        
+        # アニメーション色設定パネル
+        animation_color_group = QGroupBox("アニメーション色設定")
+        animation_color_layout = QVBoxLayout()
+        
+        # 色設定テーブル
+        self.animation_color_buttons = {}
+        
+        # アニメーションタイプと表示名の辞書
+        animation_display_names = {
+            "left_turn": "左ウィンカー",
+            "right_turn": "右ウィンカー",
+            "lane_change_left": "左車線変更",
+            "lane_change_right": "右車線変更",
+            "hazard": "ハザード",
+            "thank_you": "サンキューハザード",
+            "emergency": "緊急",
+            "forward": "前進",
+            "reverse": "後退"
+        }
+        
+        # グリッドレイアウトで色設定を整理
+        grid_layout = QGridLayout()
+        row = 0
+        
+        for animation_type, display_name in animation_display_names.items():
+            # ラベル
+            name_label = QLabel(display_name)
+            grid_layout.addWidget(name_label, row, 0)
+            
+            # 現在の設定色を取得
+            current_color = self.led_animation.get_custom_color(animation_type)
+            
+            # 色ボタン
+            color_btn = ColorPreviewButton(current_color)
+            color_btn.color_changed.connect(lambda color, anim_type=animation_type: self.on_animation_color_changed(anim_type, color))
+            self.animation_color_buttons[animation_type] = color_btn
+            grid_layout.addWidget(color_btn, row, 1)
+            
+            # デフォルトに戻すボタン
+            reset_btn = QPushButton("リセット")
+            reset_btn.clicked.connect(lambda checked=False, anim_type=animation_type: self.reset_animation_color(anim_type))
+            grid_layout.addWidget(reset_btn, row, 2)
+            
+            row += 1
+        
+        animation_color_layout.addLayout(grid_layout)
+        
+        # すべてのアニメーション色を現在の色に設定するボタン
+        set_all_btn = QPushButton("すべてのアニメーション色を現在の色に設定")
+        set_all_btn.clicked.connect(self.set_all_animation_colors)
+        animation_color_layout.addWidget(set_all_btn)
+        
+        animation_color_group.setLayout(animation_color_layout)
+        right_layout.addWidget(animation_color_group)
+        
+        # アニメーション制御部分
         animation_group = QGroupBox("ウィンカー・シグナル制御")
         animation_layout = QVBoxLayout()
         
@@ -1466,22 +1572,7 @@ class MainWindow(QMainWindow):
         animation_layout.addLayout(status_layout)
         
         animation_group.setLayout(animation_layout)
-        top_layout.addWidget(animation_group)
-        
-        # ステータス表示
-        status_layout = QHBoxLayout()
-        self.status_label = QLabel("準備完了")
-        status_layout.addWidget(self.status_label)
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        status_layout.addWidget(self.progress_bar)
-        
-        top_layout.addLayout(status_layout)
-        
-        # 下部ウィジェット（ログ部分）
-        bottom_widget = QWidget()
-        bottom_layout = QVBoxLayout(bottom_widget)
+        right_layout.addWidget(animation_group)
         
         # ログ表示部分
         log_group = QGroupBox("ログ")
@@ -1500,14 +1591,57 @@ class MainWindow(QMainWindow):
         log_layout.addLayout(log_btn_layout)
         
         log_group.setLayout(log_layout)
-        bottom_layout.addWidget(log_group)
+        right_layout.addWidget(log_group)
         
-        # スプリッターに追加
-        main_splitter.addWidget(top_widget)
-        main_splitter.addWidget(bottom_widget)
-        main_splitter.setSizes([600, 200])  # より多くのスペースを上部に
+        # 右ペインに余白を追加
+        right_layout.addStretch(1)
         
-        self.setCentralWidget(main_splitter)
+        # 左右のペインをメインレイアウトに追加
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(left_pane)
+        splitter.addWidget(right_pane)
+        
+        # 初期分割比率を設定
+        splitter.setSizes([500, 700])
+        
+        main_layout.addWidget(splitter)
+        self.setCentralWidget(main_widget)
+    
+    # アニメーション色設定関連のメソッド
+    def on_animation_color_changed(self, animation_type, color):
+        """アニメーション用のカスタム色が変更されたときの処理"""
+        self.led_animation.set_custom_color(animation_type, color)
+        self.logger.info(f"{animation_type}のカスタム色を変更しました: R={color.red()}, G={color.green()}, B={color.blue()}")
+    
+    def reset_animation_color(self, animation_type):
+        """アニメーションのカスタム色をデフォルトに戻す"""
+        default_colors = {
+            "left_turn": QColor(255, 191, 0),
+            "right_turn": QColor(255, 191, 0),
+            "lane_change_left": QColor(255, 191, 0),
+            "lane_change_right": QColor(255, 191, 0),
+            "hazard": QColor(255, 191, 0),
+            "thank_you": QColor(255, 191, 0),
+            "emergency": QColor(255, 0, 0),
+            "forward": QColor(0, 0, 255),
+            "reverse": QColor(255, 255, 255)
+        }
+        
+        if animation_type in default_colors:
+            default_color = default_colors[animation_type]
+            self.led_animation.set_custom_color(animation_type, default_color)
+            self.animation_color_buttons[animation_type].set_color(default_color)
+            self.logger.info(f"{animation_type}のカスタム色をデフォルトに戻しました")
+    
+    def set_all_animation_colors(self):
+        """すべてのアニメーション色を現在の色に設定"""
+        current_color = self.current_color
+        
+        for animation_type, button in self.animation_color_buttons.items():
+            button.set_color(current_color)
+            self.led_animation.set_custom_color(animation_type, current_color)
+        
+        self.logger.info(f"すべてのアニメーション色を現在の色に設定しました: R={current_color.red()}, G={current_color.green()}, B={current_color.blue()}")
     
     # アニメーション関連メソッド
     def start_animation(self, animation_type):

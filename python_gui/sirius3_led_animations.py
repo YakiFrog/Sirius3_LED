@@ -35,6 +35,31 @@ class LEDAnimation:
         self.color_white = QColor(255, 255, 255) # 白（バックランプ）
         self.color_blue = QColor(0, 0, 255)    # 青（特殊用途）
         
+        # アニメーション用のカスタム色設定（ユーザーが変更可能）
+        self.custom_colors = {
+            "left_turn": QColor(255, 191, 0),      # 左ウィンカー
+            "right_turn": QColor(255, 191, 0),     # 右ウィンカー
+            "lane_change_left": QColor(255, 191, 0), # 左車線変更
+            "lane_change_right": QColor(255, 191, 0), # 右車線変更
+            "hazard": QColor(255, 191, 0),         # ハザード
+            "thank_you": QColor(255, 191, 0),      # サンキューハザード
+            "emergency": QColor(255, 0, 0),        # 緊急
+            "forward": QColor(0, 0, 255),          # 前進
+            "reverse": QColor(255, 255, 255)       # 後退
+        }
+    
+    def set_custom_color(self, animation_type, color):
+        """アニメーション用のカスタム色を設定する"""
+        if animation_type in self.custom_colors:
+            self.custom_colors[animation_type] = color
+            self.logger.debug(f"{animation_type}のカスタム色を設定: R={color.red()}, G={color.green()}, B={color.blue()}")
+            return True
+        return False
+    
+    def get_custom_color(self, animation_type):
+        """アニメーション用のカスタム色を取得する"""
+        return self.custom_colors.get(animation_type)
+    
     def start_animation(self, animation_type, **kwargs):
         """指定されたアニメーションを開始する"""
         if self.running:
@@ -132,8 +157,13 @@ class LEDAnimation:
             return
             
         try:
-            # アンバー色の点滅
-            color = self.color_amber
+            # アニメーションタイプに合わせたカスタム色を取得
+            animation_type = "left_turn" if side == "LEFT" else "right_turn"
+            if self.current_animation:
+                animation_type = self.current_animation
+            
+            # カスタム色がある場合はそれを使用、なければデフォルト
+            color = self.custom_colors.get(animation_type, self.color_amber)
             r, g, b = color.red(), color.green(), color.blue()
             
             count = 0
@@ -190,8 +220,9 @@ class LEDAnimation:
             return
             
         try:
-            # アンバー色の点滅
-            color = self.color_amber
+            # カスタム色を取得（サンキューハザードかハザードか）
+            animation_type = self.current_animation or "hazard"
+            color = self.custom_colors.get(animation_type, self.color_amber)
             r, g, b = color.red(), color.green(), color.blue()
             
             count = 0
@@ -264,8 +295,8 @@ class LEDAnimation:
             return
             
         try:
-            # 赤色の点滅
-            color = self.color_red
+            # カスタム色を取得
+            color = self.custom_colors.get("emergency", self.color_red)
             r, g, b = color.red(), color.green(), color.blue()
             
             count = 0
@@ -337,13 +368,12 @@ class LEDAnimation:
             return
         
         try:
-            # 方向に応じた色を設定
+            # カスタム色を取得
+            animation_type = direction  # "forward" または "reverse"
             if direction == "forward":
-                # 発進時は青色
-                color = self.color_blue
+                color = self.custom_colors.get("forward", self.color_blue)
             else:  # reverse
-                # 後退時は白色
-                color = self.color_white
+                color = self.custom_colors.get("reverse", self.color_white)
                 
             r, g, b = color.red(), color.green(), color.blue()
             
