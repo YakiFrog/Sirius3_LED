@@ -587,6 +587,20 @@ class BLEController(QObject):
                 callback(True)
             return
         
+        # 送信するコマンドをログに詳細表示
+        command_details = []
+        for device_key, cmd_type, value in commands:
+            if cmd_type == "C":  # 色設定コマンド
+                r, g, b = value
+                command_details.append(f"{device_key}:{cmd_type}:{r},{g},{b}")
+            elif cmd_type == "T":  # 遷移コマンド
+                r, g, b, duration = value
+                command_details.append(f"{device_key}:{cmd_type}:{r},{g},{b},{duration}")
+            else:
+                command_details.append(f"{device_key}:{cmd_type}:{value}")
+        
+        self._log(logging.DEBUG, f"一括コマンド送信の詳細: {', '.join(command_details)}")
+        
         # 同時実行するために全てのコマンドを先に準備
         prepared_commands = []
         command_strs = []
@@ -1179,6 +1193,9 @@ class MainWindow(QMainWindow):
         self.led_animation.signals.animation_stopped.connect(self.on_animation_stopped)
         self.led_animation.signals.status_message.connect(self.on_animation_status)
         
+        # アニメーション後の色を白色に初期設定
+        self.led_animation.set_after_animation_color(QColor(255, 255, 255))
+        
         # コマンドキュー処理を開始
         self.ble_controller.start_queue_processor()
         
@@ -1192,7 +1209,7 @@ class MainWindow(QMainWindow):
         # コンソールハンドラー
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        formatter = logging.Formatter('%(asctime)s - %(levellevel)s - %(message)s')
         console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
         
@@ -1692,6 +1709,13 @@ class MainWindow(QMainWindow):
         self.led_animation.set_use_after_animation_color(checked)
         self.after_color_picker_btn.setEnabled(checked)
         self.set_current_as_after_btn.setEnabled(checked)
+        
+        # チェックが入ったときに、黒で見えないと困るので、白色を初期設定にする
+        if checked and self.led_animation.get_after_animation_color() == QColor(0, 0, 0):
+            # 初期値として白色を設定
+            self.led_animation.set_after_animation_color(QColor(255, 255, 255))
+            self.after_color_preview.setColor(QColor(255, 255, 255))
+            self.logger.info("アニメーション後の色を白色に初期設定しました")
         
         # ログ出力
         status = "有効" if checked else "無効"

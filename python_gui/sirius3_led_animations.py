@@ -151,22 +151,58 @@ class LEDAnimation:
         self.signals.animation_stopped.emit()
         self.signals.status_message.emit("アニメーションを停止しました")
         
-        # アニメーション後の色設定に基づいてデバイスの色を設定
+        # すべてのデバイスにコマンドを送信するためにリストを作成
+        devices_to_update = []
         for device_key in ["LEFT", "RIGHT"]:
             if self.ble_controller.connected.get(device_key, False):
-                # 明示的に固定色モードに設定する（M:0コマンドを送信）
-                self.ble_controller.set_mode(device_key, False)
-                self.logger.debug(f"{device_key}デバイスを固定色モードに設定")
-                
-                if self.use_after_animation_color:
-                    # アニメーション後の色を使用する場合
-                    r, g, b = self.after_animation_color.red(), self.after_animation_color.green(), self.after_animation_color.blue()
-                    self.ble_controller.set_rgb_color(device_key, r, g, b)
-                    self.logger.debug(f"{device_key}デバイスにアニメーション後の色を適用: R={r}, G={g}, B={b}")
-                else:
-                    # 使用しない場合は消灯（黒だとArduino側で特別扱いされる可能性があるため非常に暗い色を使用）
-                    self.ble_controller.set_rgb_color(device_key, 1, 1, 1)  # 完全な黒ではなく非常に暗い色
-                    self.logger.debug(f"{device_key}デバイスを消灯状態に設定")
+                devices_to_update.append(device_key)
+        
+        if not devices_to_update:
+            self.logger.warning("接続されているデバイスがありません。アニメーション後の色を設定できません。")
+            return
+        
+        self.logger.info(f"アニメーション後の色設定を適用します。接続デバイス: {', '.join(devices_to_update)}")
+        
+        # コマンドを複数のデバイスに同時に送信するための準備
+        color_commands = []
+        mode_commands = []
+        
+        # アニメーション後の色設定に基づいてコマンドを準備
+        self.logger.debug(f"アニメーション後の色の使用設定: {self.use_after_animation_color}")
+        
+        if self.use_after_animation_color:
+            # アニメーション後の色を使用する場合
+            r, g, b = self.after_animation_color.red(), self.after_animation_color.green(), self.after_animation_color.blue()
+            self.logger.info(f"アニメーション後の色を適用: R={r}, G={g}, B={b}")
+            
+            # 各デバイスに適用するコマンドを追加
+            for device_key in devices_to_update:
+                # まず色設定コマンドを用意
+                color_commands.append((device_key, "C", (r, g, b)))
+                # 次にモード設定コマンドを用意（固定色モード=0）
+                mode_commands.append((device_key, "M", 0))
+        else:
+            # 使用しない場合は消灯（黒だとArduino側で特別扱いされる可能性があるため非常に暗い色を使用）
+            self.logger.info("アニメーション後の色を使用しないため消灯します")
+            for device_key in devices_to_update:
+                # まず色設定コマンドを用意（非常に暗い色）
+                color_commands.append((device_key, "C", (1, 1, 1)))
+                # 次にモード設定コマンドを用意（固定色モード=0）
+                mode_commands.append((device_key, "M", 0))
+        
+        # まず色設定コマンドを送信
+        if color_commands:
+            self.logger.debug(f"色設定コマンドを送信: {color_commands}")
+            self.ble_controller._send_commands_simultaneously(color_commands)
+            # コマンド間に少し間隔を空ける
+            time.sleep(0.1)
+        
+        # 次にモード設定コマンドを送信
+        if mode_commands:
+            self.logger.debug(f"モード設定コマンドを送信: {mode_commands}")
+            self.ble_controller._send_commands_simultaneously(mode_commands)
+        
+        self.logger.info("アニメーション後の設定適用完了")
     
     def _turn_signal_animation(self, side, speed=None, cycles=None, transition_time=None):
         """ウィンカーアニメーション（右折/左折/車線変更）
@@ -201,6 +237,16 @@ class LEDAnimation:
             color = self.custom_colors.get(animation_type, self.color_amber)
             r, g, b = color.red(), color.green(), color.blue()
             
+            # 反対側のデバイスを特定
+            opposite_device = "RIGHT" if side == "LEFT" else "LEFT"
+            opposite_connected = self.ble_controller.connected.get(opposite_device, False)
+            
+            # 反対側のデバイスが接続されている場合、消灯状態にする
+            if opposite_connected:
+                self.ble_controller.set_rgb_color(opposite_device, 1, 1, 1)  # 非常に暗い色で事実上消灯
+                self.ble_controller.set_mode(opposite_device, False)  # 固定色モードに設定
+                self.logger.debug(f"{opposite_device}デバイスを消灯状態に設定")
+            
             count = 0
             while not self.stop_event.is_set() and count < cycles:
                 # 点灯
@@ -224,7 +270,16 @@ class LEDAnimation:
                 
             # アニメーション終了、消灯状態に
             if not self.stop_event.is_set():
-                self.ble_controller.set_rgb_color(target_device, 0, 0, 0)
+                # 両方のデバイスに対して消灯コマンドを送信
+                commands = []
+                for device_key in ["LEFT", "RIGHT"]:
+                    if self.ble_controller.connected.get(device_key, False):
+                        commands.append((device_key, "C", (1, 1, 1)))  # 非常に暗い色
+                
+                if commands:
+                    self.ble_controller._send_commands_simultaneously(commands)
+                    self.logger.debug("アニメーション終了時に両方のデバイスを消灯状態に設定")
+                
                 self.running = False
                 self.signals.animation_stopped.emit()
                 
@@ -293,13 +348,17 @@ class LEDAnimation:
                 
             # アニメーション終了、消灯状態に
             if not self.stop_event.is_set():
+                # 両方のデバイスに対して消灯コマンドを送信（元のコードと同様）
                 commands = []
                 if left_connected:
-                    commands.append(("LEFT", "C", (0, 0, 0)))
+                    commands.append(("LEFT", "C", (1, 1, 1)))  # 非常に暗い色
                 if right_connected:
-                    commands.append(("RIGHT", "C", (0, 0, 0)))
+                    commands.append(("RIGHT", "C", (1, 1, 1)))  # 非常に暗い色
                 
-                self.ble_controller._send_commands_simultaneously(commands)
+                if commands:
+                    self.ble_controller._send_commands_simultaneously(commands)
+                    self.logger.debug("アニメーション終了時に両方のデバイスを消灯状態に設定")
+                
                 self.running = False
                 self.signals.animation_stopped.emit()
                 
@@ -367,13 +426,17 @@ class LEDAnimation:
                 
             # アニメーション終了、消灯状態に
             if not self.stop_event.is_set():
+                # 両方のデバイスに対して消灯コマンドを送信（元のコードと同様）
                 commands = []
                 if left_connected:
-                    commands.append(("LEFT", "C", (0, 0, 0)))
+                    commands.append(("LEFT", "C", (1, 1, 1)))  # 非常に暗い色
                 if right_connected:
-                    commands.append(("RIGHT", "C", (0, 0, 0)))
+                    commands.append(("RIGHT", "C", (1, 1, 1)))  # 非常に暗い色
                 
-                self.ble_controller._send_commands_simultaneously(commands)
+                if commands:
+                    self.ble_controller._send_commands_simultaneously(commands)
+                    self.logger.debug("アニメーション終了時に両方のデバイスを消灯状態に設定")
+                
                 self.running = False
                 self.signals.animation_stopped.emit()
                 
@@ -442,6 +505,17 @@ class LEDAnimation:
             
             # アニメーション終了
             if not self.stop_event.is_set():
+                # 両方のデバイスに対して消灯コマンドを送信
+                commands = []
+                if left_connected:
+                    commands.append(("LEFT", "C", (1, 1, 1)))  # 非常に暗い色
+                if right_connected:
+                    commands.append(("RIGHT", "C", (1, 1, 1)))  # 非常に暗い色
+                
+                if commands:
+                    self.ble_controller._send_commands_simultaneously(commands)
+                    self.logger.debug("アニメーション終了時に両方のデバイスを消灯状態に設定")
+                
                 self.running = False
                 self.signals.animation_stopped.emit()
                 
