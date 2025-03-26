@@ -20,9 +20,12 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QHBoxLayout, QPushButton, QLabel, QSlider, QComboBox,
                               QGroupBox, QCheckBox, QColorDialog, QMessageBox,
                               QTextEdit, QSplitter, QProgressBar, QRadioButton,
-                              QButtonGroup)
+                              QButtonGroup, QGridLayout)
 from PySide6.QtCore import Qt, Signal, Slot, QObject, QTimer, QSize, QEvent
-from PySide6.QtGui import QColor, QPainter, QBrush, QTextCursor, QFont
+from PySide6.QtGui import QColor, QPainter, QBrush, QTextCursor, QFont, QIcon
+
+# シリウス3アニメーションをインポート
+from sirius3_led_animations import LEDAnimation
 
 # BLEデバイス情報
 DEVICE_NAMES = {
@@ -413,7 +416,7 @@ class BLEController(QObject):
                 
                 target_device = None
                 for device in devices:
-                    if device.name == device_name:
+                    if (device.name == device_name):
                         self._log(logging.INFO, f"デバイスが見つかりました: {device.name} ({device.address})")
                         target_device = device
                         break
@@ -1142,6 +1145,12 @@ class MainWindow(QMainWindow):
         self.ble_controller.signals.log_message.connect(self.log_message)
         self.ble_controller.signals.error_occurred.connect(self.show_error)
         
+        # LEDアニメーションコントローラーの初期化
+        self.led_animation = LEDAnimation(self.ble_controller)
+        self.led_animation.signals.animation_started.connect(self.on_animation_started)
+        self.led_animation.signals.animation_stopped.connect(self.on_animation_stopped)
+        self.led_animation.signals.status_message.connect(self.on_animation_status)
+        
         # コマンドキュー処理を開始
         self.ble_controller.start_queue_processor()
         
@@ -1382,6 +1391,83 @@ class MainWindow(QMainWindow):
         apply_group.setLayout(apply_layout)
         top_layout.addWidget(apply_group)
         
+        # アニメーション制御部分（新規追加）
+        animation_group = QGroupBox("ウィンカー・シグナル制御")
+        animation_layout = QVBoxLayout()
+        
+        # ウィンカーコントロール
+        turn_layout = QHBoxLayout()
+        self.left_turn_btn = QPushButton("左ウィンカー")
+        self.left_turn_btn.clicked.connect(lambda: self.start_animation("left_turn"))
+        self.left_turn_btn.setMinimumHeight(40)
+        
+        self.hazard_btn = QPushButton("ハザード")
+        self.hazard_btn.clicked.connect(lambda: self.start_animation("hazard"))
+        self.hazard_btn.setMinimumHeight(40)
+        
+        self.right_turn_btn = QPushButton("右ウィンカー")
+        self.right_turn_btn.clicked.connect(lambda: self.start_animation("right_turn"))
+        self.right_turn_btn.setMinimumHeight(40)
+        
+        turn_layout.addWidget(self.left_turn_btn)
+        turn_layout.addWidget(self.hazard_btn)
+        turn_layout.addWidget(self.right_turn_btn)
+        animation_layout.addLayout(turn_layout)
+        
+        # 車線変更コントロール
+        lane_layout = QHBoxLayout()
+        self.lane_left_btn = QPushButton("左車線変更")
+        self.lane_left_btn.clicked.connect(lambda: self.start_animation("lane_change_left"))
+        
+        self.thank_you_btn = QPushButton("サンキューハザード")
+        self.thank_you_btn.clicked.connect(lambda: self.start_animation("thank_you"))
+        
+        self.lane_right_btn = QPushButton("右車線変更")
+        self.lane_right_btn.clicked.connect(lambda: self.start_animation("lane_change_right"))
+        
+        lane_layout.addWidget(self.lane_left_btn)
+        lane_layout.addWidget(self.thank_you_btn)
+        lane_layout.addWidget(self.lane_right_btn)
+        animation_layout.addLayout(lane_layout)
+        
+        # 前進・後退コントロール
+        move_layout = QHBoxLayout()
+        self.forward_btn = QPushButton("前進")
+        self.forward_btn.clicked.connect(lambda: self.start_animation("forward"))
+        
+        self.emergency_btn = QPushButton("緊急")
+        self.emergency_btn.clicked.connect(lambda: self.start_animation("emergency"))
+        self.emergency_btn.setStyleSheet("background-color: #ff6b6b;")
+        
+        self.reverse_btn = QPushButton("後退")
+        self.reverse_btn.clicked.connect(lambda: self.start_animation("reverse"))
+        
+        move_layout.addWidget(self.forward_btn)
+        move_layout.addWidget(self.emergency_btn)
+        move_layout.addWidget(self.reverse_btn)
+        animation_layout.addLayout(move_layout)
+        
+        # アニメーション停止ボタン
+        stop_layout = QHBoxLayout()
+        self.stop_animation_btn = QPushButton("アニメーション停止")
+        self.stop_animation_btn.setMinimumHeight(40)
+        self.stop_animation_btn.setStyleSheet("font-weight: bold;")
+        self.stop_animation_btn.clicked.connect(self.stop_animation)
+        self.stop_animation_btn.setEnabled(False)  # 初期状態は無効
+        stop_layout.addWidget(self.stop_animation_btn)
+        animation_layout.addLayout(stop_layout)
+        
+        # アニメーションステータス
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(QLabel("現在のアニメーション:"))
+        self.animation_status = QLabel("なし")
+        self.animation_status.setStyleSheet("font-weight: bold;")
+        status_layout.addWidget(self.animation_status)
+        animation_layout.addLayout(status_layout)
+        
+        animation_group.setLayout(animation_layout)
+        top_layout.addWidget(animation_group)
+        
         # ステータス表示
         status_layout = QHBoxLayout()
         self.status_label = QLabel("準備完了")
@@ -1419,10 +1505,107 @@ class MainWindow(QMainWindow):
         # スプリッターに追加
         main_splitter.addWidget(top_widget)
         main_splitter.addWidget(bottom_widget)
-        main_splitter.setSizes([400, 200])
+        main_splitter.setSizes([600, 200])  # より多くのスペースを上部に
         
         self.setCentralWidget(main_splitter)
+    
+    # アニメーション関連メソッド
+    def start_animation(self, animation_type):
+        """指定されたアニメーションを開始する"""
+        # 接続状態の確認
+        if not (self.ble_controller.connected.get("LEFT", False) or 
+                self.ble_controller.connected.get("RIGHT", False)):
+            self.logger.warning("デバイスが接続されていません。アニメーションを開始できません。")
+            QMessageBox.warning(self, "接続エラー", "少なくとも一つのデバイスを接続してください。")
+            return
+        
+        # 音楽連動モードをオフにする
+        if self.audio_mode:
+            self.fixed_mode_radio.setChecked(True)
+            self.audio_processor.stop()
+            self.ble_controller.set_audio_mode(False)
+            self.audio_mode = False
+        
+        # アニメーション開始
+        self.led_animation.start_animation(animation_type)
+        
+        # 停止ボタンを有効化
+        self.stop_animation_btn.setEnabled(True)
+        
+        # ボタンのアクティブ状態を視覚的に示す
+        self.reset_animation_buttons()
+        
+        # クリックされたボタンをハイライト
+        if animation_type == "left_turn":
+            self.left_turn_btn.setStyleSheet("background-color: #f0ad4e; font-weight: bold;")
+        elif animation_type == "right_turn":
+            self.right_turn_btn.setStyleSheet("background-color: #f0ad4e; font-weight: bold;")
+        elif animation_type == "hazard":
+            self.hazard_btn.setStyleSheet("background-color: #f0ad4e; font-weight: bold;")
+        elif animation_type == "lane_change_left":
+            self.lane_left_btn.setStyleSheet("background-color: #f0ad4e; font-weight: bold;")
+        elif animation_type == "lane_change_right":
+            self.lane_right_btn.setStyleSheet("background-color: #f0ad4e; font-weight: bold;")
+        elif animation_type == "thank_you":
+            self.thank_you_btn.setStyleSheet("background-color: #f0ad4e; font-weight: bold;")
+        elif animation_type == "emergency":
+            self.emergency_btn.setStyleSheet("background-color: #ff0000; color: white; font-weight: bold;")
+        elif animation_type == "forward":
+            self.forward_btn.setStyleSheet("background-color: #5bc0de; font-weight: bold;")
+        elif animation_type == "reverse":
+            self.reverse_btn.setStyleSheet("background-color: #5bc0de; font-weight: bold;")
+    
+    def stop_animation(self):
+        """実行中のアニメーションを停止する"""
+        self.led_animation.stop_animation()
+        self.stop_animation_btn.setEnabled(False)
+        self.reset_animation_buttons()
+        self.animation_status.setText("なし")
+    
+    def reset_animation_buttons(self):
+        """全てのアニメーションボタンのスタイルをリセット"""
+        self.left_turn_btn.setStyleSheet("")
+        self.right_turn_btn.setStyleSheet("")
+        self.hazard_btn.setStyleSheet("")
+        self.lane_left_btn.setStyleSheet("")
+        self.lane_right_btn.setStyleSheet("")
+        self.thank_you_btn.setStyleSheet("")
+        self.emergency_btn.setStyleSheet("background-color: #ff6b6b;")
+        self.forward_btn.setStyleSheet("")
+        self.reverse_btn.setStyleSheet("")
+    
+    def on_animation_started(self, animation_type):
+        """アニメーション開始時のコールバック"""
+        # 日本語の表示名に変換
+        display_names = {
+            "right_turn": "右ウィンカー",
+            "left_turn": "左ウィンカー", 
+            "lane_change_right": "右車線変更",
+            "lane_change_left": "左車線変更",
+            "hazard": "ハザード",
+            "thank_you": "サンキューハザード",
+            "emergency": "緊急",
+            "forward": "前進",
+            "reverse": "後退"
+        }
+        
+        display_name = display_names.get(animation_type, animation_type)
+        self.animation_status.setText(display_name)
+        self.logger.info(f"{display_name}アニメーションを開始しました")
+    
+    def on_animation_stopped(self):
+        """アニメーション停止時のコールバック"""
+        self.stop_animation_btn.setEnabled(False)
+        self.reset_animation_buttons()
+        self.animation_status.setText("なし")
+        self.logger.info("アニメーションを停止しました")
+    
+    def on_animation_status(self, message):
+        """アニメーションステータスメッセージを処理"""
+        self.status_label.setText(message)
+        self.status_label.setStyleSheet("color: blue;")
 
+    # 既存のメソッド
     def log_message(self, level, message):
         """ログメッセージを記録"""
         if level == logging.DEBUG:
@@ -1478,6 +1661,7 @@ class MainWindow(QMainWindow):
     @Slot(str, bool)
     def update_connection_status(self, device_key, connected):
         """接続状態の表示を更新"""
+        # 元のコードを実行
         if device_key == "LEFT":
             btn = self.left_connect_btn
             label = self.left_status_label
@@ -1517,8 +1701,15 @@ class MainWindow(QMainWindow):
             self.ble_controller.connected.get("LEFT", False) and 
             self.ble_controller.connected.get("RIGHT", False)
         )
-    
-    @Slot(str, bool, str)
+        
+        # アニメーション実行中の場合は停止
+        if self.led_animation.running and not (
+            self.ble_controller.connected.get("LEFT", False) or 
+            self.ble_controller.connected.get("RIGHT", False)
+        ):
+            self.stop_animation()
+
+    # その他の既存メソッド
     def update_command_status(self, device_key, success, message):
         """コマンド実行状態を更新"""
         if success:
@@ -1889,6 +2080,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """アプリケーション終了時の処理"""
         self.logger.info("アプリケーションを終了します")
+        
+        # アニメーションを停止
+        if hasattr(self, 'led_animation') and self.led_animation.running:
+            self.led_animation.stop_animation()
         
         # オーディオ処理を停止
         if hasattr(self, 'audio_processor'):
