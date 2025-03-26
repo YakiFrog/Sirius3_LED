@@ -274,7 +274,7 @@ class BLEController(QObject):
         # オーディオ連動モード
         self.audio_mode = False
         self.audio_timer = None
-        self.audio_transition_time = 200  # オーディオ遷移時間のデフォルト値(ms)
+        self.audio_transition_time = 100  # オーディオ遷移時間のデフォルト値(ms)
     
     def start_queue_processor(self):
         """コマンドキュー処理スレッドを開始"""
@@ -805,36 +805,37 @@ class AudioProcessor(QObject):
         # FFT解析用のバッファ
         self.fft_buffer = deque(maxlen=8)  # バッファサイズを増やす
         
-        # パラメータ設定を調整
-        self.sensitivity = 0.65      # 感度を上げる
-        self.smoothing = 0.85       # スムージングをより強く
-        self.bass_boost = 1.2       # 低音の強調を調整
-        self.treble_boost = 1.1     # 高音の強調を調整
+        # パラメータ設定を調整 - 感度を上げてスムージングを減らす
+        self.sensitivity = 0.85      # 感度を大幅に上げる（0.65→0.85）
+        self.smoothing = 0.65        # スムージングを減らす（0.85→0.65）
+        self.bass_boost = 1.3        # 低音の強調を増加
+        self.treble_boost = 1.2      # 高音の強調を増加
         
-        # 色変化用のパラメータ調整
-        self.color_smoothing = 0.82  # 色の変化をより滑らかに
-        self.saturation_min = 0.6    # 最小彩度を上げる（より鮮やか）
-        self.value_min = 0.5         # 最小明度を上げる（より明るく）
-        self.value_boost = 1.4       # 明度のブースト係数を上げる
+        # 色変化用のパラメータ調整 - よりダイナミックな変化
+        self.color_smoothing = 0.55   # 色の変化のスムージングを減らす（0.82→0.55）
+        self.saturation_min = 0.65    # 最小彩度を上げる
+        self.value_min = 0.3          # 最小明度を下げる（0.5→0.3）- より暗く
+        self.value_max = 1.0          # 最大明度
+        self.value_boost = 1.7        # 明度のブースト係数を上げる（1.4→1.7）
         
-        # FFTバッファサイズを増やして安定化
-        self.fft_buffer = deque(maxlen=12)  # バッファサイズを増やす
+        # FFTバッファサイズを調整
+        self.fft_buffer = deque(maxlen=6)  # バッファサイズを減らして反応速度を上げる（12→6）
         
         # 色相範囲の設定（0-1の範囲）
         self.hue_range = (0.0, 1.0)  # 全色相を使用
         
-        # 移動平均用のバッファサイズを増やす
-        self.hue_buffer_size = 8
-        self.value_buffer_size = 8
+        # 移動平均用のバッファサイズを減らす
+        self.hue_buffer_size = 4     # より速い色相の変化（8→4）
+        self.value_buffer_size = 4    # より速い明度の変化（8→4）
         
-        # バンドごとの重み付け調整
+        # バンドごとの重み付け調整 - ベースと高音をより強調
         self.band_weights = {
-            "sub_bass": 1.8,   # サブベース
-            "bass": 1.5,       # ベース
-            "low_mid": 1.2,    # 低中音
+            "sub_bass": 2.0,   # サブベースの重みを上げる（1.8→2.0）
+            "bass": 1.8,       # ベースの重みを上げる（1.5→1.8）
+            "low_mid": 1.3,    # 低中音（1.2→1.3）
             "mid": 1.0,        # 中音
-            "high_mid": 1.3,   # 高中音
-            "high": 1.4        # 高音
+            "high_mid": 1.5,   # 高中音の重みを上げる（1.3→1.5）
+            "high": 1.7        # 高音の重みを上げる（1.4→1.7）
         }
         
         # 前回の色とレベル値（スムージング用）
@@ -844,14 +845,25 @@ class AudioProcessor(QObject):
         self.prev_level = 0.0
         
         # パワー計算用の指数
-        self.power_scale = 1.5     # パワースペクトルのスケーリング係数
+        self.power_scale = 1.8     # パワースペクトルのスケーリング係数を上げる（1.5→1.8）
         
         # 色相範囲の制限（0-1の範囲で）
-        self.hue_range = (0.0, 0.85)  # 赤から紫までの範囲
+        self.hue_range = (0.0, 0.9)  # 色相範囲を広げる（0.85→0.9）
         
         # 音声反応の更新間隔調整 (ミリ秒)
-        self.update_interval = 150  # 0.15秒ごとに更新
+        self.update_interval = 100  # 更新間隔を短くする（150→100ms）
         self.last_update_time = 0
+        
+        # ピーク検出用のパラメータ
+        self.peak_detection = True   # ピーク検出を有効化
+        self.peak_threshold = 0.6    # ピーク検出の閾値
+        self.peak_multiplier = 1.5   # ピーク検出時の明度倍率
+        self.peak_duration = 100     # ピーク効果の持続時間（ミリ秒）
+        self.last_peak_time = 0      # 最後にピークを検出した時間
+        self.in_peak = False         # ピーク状態フラグ
+        
+        # 音量レベルの履歴（ピーク検出用）
+        self.level_history = deque(maxlen=20)
     
     def start(self):
         """オーディオ処理を開始"""
@@ -942,9 +954,9 @@ class AudioProcessor(QObject):
             "high": (4000, 12000)    # 高音
         }
         
-        # 移動平均用のバッファ
-        hue_buffer = deque([0.0] * 5, maxlen=5)
-        value_buffer = deque([0.0] * 5, maxlen=5)
+        # 移動平均用のバッファ（サイズを小さくして反応速度アップ）
+        hue_buffer = deque([0.0] * self.hue_buffer_size, maxlen=self.hue_buffer_size)
+        value_buffer = deque([0.0] * self.value_buffer_size, maxlen=self.value_buffer_size)
         
         while self.running:
             try:
@@ -1016,23 +1028,57 @@ class AudioProcessor(QObject):
                 mid_energy = (band_levels["low_mid"] + band_levels["mid"] + band_levels["high_mid"]) / 3.0
                 target_saturation = max(
                     self.saturation_min,
-                    min(1.0, mid_energy * 2.0 * self.sensitivity)
+                    min(1.0, mid_energy * 2.5 * self.sensitivity)  # 彩度の感度を上げる（2.0→2.5）
                 )
                 
                 # 全体的な強度で明度を決定
                 overall_level = np.mean([
                     band_levels[band] for band in bands.keys()
                 ])
+                
+                # ピーク検出のための音量履歴を更新
+                self.level_history.append(overall_level)
+                
+                # ピーク検出処理
+                peak_detected = False
+                current_time = int(time.time() * 1000)  # 現在時刻（ミリ秒）
+                
+                if self.peak_detection and len(self.level_history) >= 5:
+                    # 直近の平均レベルを計算
+                    recent_avg = np.mean(list(self.level_history)[-5:])
+                    # 全体の平均レベルを計算
+                    overall_avg = np.mean(self.level_history)
+                    
+                    # 直近の値が平均より大幅に大きい場合はピークと判定
+                    if (recent_avg > overall_avg * self.peak_threshold and 
+                        recent_avg > self.prev_level * 1.3 and
+                        current_time - self.last_peak_time > self.peak_duration * 0.5):
+                        peak_detected = True
+                        self.last_peak_time = current_time
+                        self.in_peak = True
+                
+                # ピーク効果の適用（ピーク検出時または持続時間内）
+                if self.in_peak:
+                    # ピーク効果の持続時間をチェック
+                    if current_time - self.last_peak_time > self.peak_duration:
+                        self.in_peak = False
+                    else:
+                        # ピーク効果の強さを時間経過で減衰させる
+                        peak_factor = 1.0 - ((current_time - self.last_peak_time) / self.peak_duration)
+                        # 明度を増加させる効果
+                        overall_level *= (1.0 + (self.peak_multiplier - 1.0) * peak_factor)
+                
+                # 明度の計算（範囲を広げる）
                 base_value = max(
                     self.value_min,
-                    min(1.0, overall_level * self.sensitivity * self.value_boost)
+                    min(self.value_max, overall_level * self.sensitivity * self.value_boost)
                 )
                 
-                # 明度の移動平均を計算
+                # 明度の移動平均を計算（バッファサイズを減らして反応を早く）
                 value_buffer.append(base_value)
                 smoothed_value = np.mean(value_buffer)
                 
-                # さらに強いスムージング処理
+                # スムージング処理（スムージングを減らしてより直接的な反応に）
                 hue = smoothed_hue * (1.0 - self.color_smoothing) + self.prev_hue * self.color_smoothing
                 saturation = target_saturation * (1.0 - self.color_smoothing) + self.prev_saturation * self.color_smoothing
                 value = smoothed_value * (1.0 - self.smoothing) + self.prev_value * self.smoothing
@@ -1041,6 +1087,7 @@ class AudioProcessor(QObject):
                 self.prev_hue = hue
                 self.prev_saturation = saturation
                 self.prev_value = value
+                self.prev_level = overall_level
                 
                 # HSVからRGBに変換
                 r, g, b = colorsys.hsv_to_rgb(hue, saturation, value)
@@ -1053,14 +1100,13 @@ class AudioProcessor(QObject):
                 )
                 
                 # 更新間隔を制限して信号発信
-                current_time = int(time.time() * 1000)  # 現在時刻（ミリ秒）
-                if current_time - self.last_update_time >= self.update_interval:
+                if current_time - self.last_update_time >= self.update_interval or peak_detected:
                     self.color_changed.emit(color)
                     self.audio_level.emit(smoothed_value)
                     self.last_update_time = current_time
                 
-                # フレームレートを調整
-                time.sleep(0.04)  # 25FPSに制限してより安定した表示に
+                # フレームレートを調整（より高いフレームレートで応答性を向上）
+                time.sleep(0.03)  # 約33FPSに調整（0.04→0.03）
                 
             except Exception as e:
                 logging.error(f"オーディオ処理中にエラー: {str(e)}")
@@ -1239,10 +1285,10 @@ class MainWindow(QMainWindow):
         audio_transition_layout.addWidget(QLabel("音声連動遷移時間:"))
         self.audio_transition_slider = QSlider(Qt.Horizontal)
         self.audio_transition_slider.setRange(50, 300)  # 50msから300ms
-        self.audio_transition_slider.setValue(200)  # デフォルト200ms
+        self.audio_transition_slider.setValue(100)  # デフォルト200ms
         self.audio_transition_slider.valueChanged.connect(self.update_audio_transition_time)
         audio_transition_layout.addWidget(self.audio_transition_slider)
-        self.audio_transition_label = QLabel("200 ms")
+        self.audio_transition_label = QLabel("100 ms")
         audio_transition_layout.addWidget(self.audio_transition_label)
         color_layout.addLayout(audio_transition_layout)
         
