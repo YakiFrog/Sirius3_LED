@@ -6,7 +6,7 @@
 #include <BLE2902.h>
 
 // 各基板で変更するデバイスID（基板1には1、基板2には2を設定）
-#define DEVICE_ID 2
+#define DEVICE_ID 1
 
 // デバイス固有の設定
 #if DEVICE_ID == 1
@@ -227,17 +227,12 @@ void loop() {
   } 
   else if (colorMode == MODE_FIXED || colorMode == MODE_TRANSITION) {
     // 固定色モードまたは遷移完了後（現在のcolorModeを維持）
-    if (currentColor.r == 0 && currentColor.g == 0 && currentColor.b == 0) {
-      // 特定の色相の色を使用
-      fill_solid(leds, NUM_LEDS, CHSV(gHue, 255, 255));
-    } else {
-      // RGB指定の色を使用
-      fill_solid(leds, NUM_LEDS, currentColor);
-    }
+    // 色相による色の使用は廃止し、常に指定されたRGB値を使用する
+    fill_solid(leds, NUM_LEDS, currentColor);
   }
   
   // LEDを更新
   FastLED.show();
-  // フレームレートの調整
+  // フレームレートの調整tLED.delay(1000/60); // 約60fps
   FastLED.delay(1000/60); // 約60fps
 }

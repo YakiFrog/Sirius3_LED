@@ -47,6 +47,10 @@ class LEDAnimation:
             "forward": QColor(0, 0, 255),          # 前進
             "reverse": QColor(255, 255, 255)       # 後退
         }
+        
+        # アニメーション後の色設定（新規追加）
+        self.after_animation_color = QColor(0, 0, 0)  # デフォルトは消灯（黒）
+        self.use_after_animation_color = False        # アニメーション後の色を使用するかどうか
     
     def set_custom_color(self, animation_type, color):
         """アニメーション用のカスタム色を設定する"""
@@ -59,6 +63,25 @@ class LEDAnimation:
     def get_custom_color(self, animation_type):
         """アニメーション用のカスタム色を取得する"""
         return self.custom_colors.get(animation_type)
+    
+    def set_after_animation_color(self, color):
+        """アニメーション後の色を設定する"""
+        self.after_animation_color = color
+        self.logger.debug(f"アニメーション後の色を設定: R={color.red()}, G={color.green()}, B={color.blue()}")
+    
+    def get_after_animation_color(self):
+        """アニメーション後の色を取得する"""
+        return self.after_animation_color
+    
+    def set_use_after_animation_color(self, use):
+        """アニメーション後の色を使用するかどうかを設定する"""
+        self.use_after_animation_color = use
+        status = "有効" if use else "無効"
+        self.logger.debug(f"アニメーション後の色の使用: {status}")
+    
+    def is_using_after_animation_color(self):
+        """アニメーション後の色を使用するかどうかを取得する"""
+        return self.use_after_animation_color
     
     def start_animation(self, animation_type, **kwargs):
         """指定されたアニメーションを開始する"""
@@ -128,10 +151,22 @@ class LEDAnimation:
         self.signals.animation_stopped.emit()
         self.signals.status_message.emit("アニメーションを停止しました")
         
-        # デバイスをオフに戻す
+        # アニメーション後の色設定に基づいてデバイスの色を設定
         for device_key in ["LEFT", "RIGHT"]:
             if self.ble_controller.connected.get(device_key, False):
-                self.ble_controller.set_rgb_color(device_key, 0, 0, 0)
+                # 明示的に固定色モードに設定する（M:0コマンドを送信）
+                self.ble_controller.set_mode(device_key, False)
+                self.logger.debug(f"{device_key}デバイスを固定色モードに設定")
+                
+                if self.use_after_animation_color:
+                    # アニメーション後の色を使用する場合
+                    r, g, b = self.after_animation_color.red(), self.after_animation_color.green(), self.after_animation_color.blue()
+                    self.ble_controller.set_rgb_color(device_key, r, g, b)
+                    self.logger.debug(f"{device_key}デバイスにアニメーション後の色を適用: R={r}, G={g}, B={b}")
+                else:
+                    # 使用しない場合は消灯（黒だとArduino側で特別扱いされる可能性があるため非常に暗い色を使用）
+                    self.ble_controller.set_rgb_color(device_key, 1, 1, 1)  # 完全な黒ではなく非常に暗い色
+                    self.logger.debug(f"{device_key}デバイスを消灯状態に設定")
     
     def _turn_signal_animation(self, side, speed=None, cycles=None, transition_time=None):
         """ウィンカーアニメーション（右折/左折/車線変更）

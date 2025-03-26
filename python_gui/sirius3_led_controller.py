@@ -1497,6 +1497,49 @@ class MainWindow(QMainWindow):
         animation_color_group.setLayout(animation_color_layout)
         right_layout.addWidget(animation_color_group)
         
+        # アニメーション後の色設定パネル（新規追加）
+        after_animation_group = QGroupBox("アニメーション後の色設定")
+        after_animation_layout = QVBoxLayout()
+        
+        # アニメーション後の色を使用するかどうかのチェックボックス
+        self.use_after_color_check = QCheckBox("アニメーション後の色を使用する")
+        self.use_after_color_check.setChecked(self.led_animation.is_using_after_animation_color())
+        self.use_after_color_check.toggled.connect(self.on_use_after_color_toggled)
+        after_animation_layout.addWidget(self.use_after_color_check)
+        
+        # 色設定部分
+        after_color_layout = QHBoxLayout()
+        after_color_layout.addWidget(QLabel("アニメーション後の色:"))
+        
+        # 現在の設定を取得
+        current_after_color = self.led_animation.get_after_animation_color()
+        
+        # 色プレビュー
+        self.after_color_preview = ColorPreviewWidget()
+        self.after_color_preview.setMinimumHeight(40)
+        self.after_color_preview.setColor(current_after_color)
+        after_color_layout.addWidget(self.after_color_preview)
+        
+        after_animation_layout.addLayout(after_color_layout)
+        
+        # 色選択ボタン
+        after_color_btn_layout = QHBoxLayout()
+        self.after_color_picker_btn = QPushButton("アニメーション後の色を選択")
+        self.after_color_picker_btn.clicked.connect(self.show_after_color_picker)
+        self.after_color_picker_btn.setEnabled(self.led_animation.is_using_after_animation_color())
+        after_color_btn_layout.addWidget(self.after_color_picker_btn)
+        
+        # 現在の色をアニメーション後の色に設定するボタン
+        self.set_current_as_after_btn = QPushButton("現在の色をアニメーション後の色に設定")
+        self.set_current_as_after_btn.clicked.connect(self.set_current_as_after_color)
+        self.set_current_as_after_btn.setEnabled(self.led_animation.is_using_after_animation_color())
+        after_color_btn_layout.addWidget(self.set_current_as_after_btn)
+        
+        after_animation_layout.addLayout(after_color_btn_layout)
+        
+        after_animation_group.setLayout(after_animation_layout)
+        right_layout.addWidget(after_animation_group)
+        
         # アニメーション制御部分
         animation_group = QGroupBox("ウィンカー・シグナル制御")
         animation_layout = QVBoxLayout()
@@ -1642,6 +1685,32 @@ class MainWindow(QMainWindow):
             self.led_animation.set_custom_color(animation_type, current_color)
         
         self.logger.info(f"すべてのアニメーション色を現在の色に設定しました: R={current_color.red()}, G={current_color.green()}, B={current_color.blue()}")
+    
+    # アニメーション後の色に関するメソッド
+    def on_use_after_color_toggled(self, checked):
+        """アニメーション後の色を使用するかどうかが変更されたときの処理"""
+        self.led_animation.set_use_after_animation_color(checked)
+        self.after_color_picker_btn.setEnabled(checked)
+        self.set_current_as_after_btn.setEnabled(checked)
+        
+        # ログ出力
+        status = "有効" if checked else "無効"
+        self.logger.info(f"アニメーション後の色の使用を{status}にしました")
+    
+    def show_after_color_picker(self):
+        """アニメーション後の色のカラーピッカーダイアログを表示"""
+        current_color = self.led_animation.get_after_animation_color()
+        color = QColorDialog.getColor(current_color, self, "アニメーション後の色を選択")
+        if color.isValid():
+            self.led_animation.set_after_animation_color(color)
+            self.after_color_preview.setColor(color)
+            self.logger.info(f"アニメーション後の色を変更しました: R={color.red()}, G={color.green()}, B={color.blue()}")
+    
+    def set_current_as_after_color(self):
+        """現在の色をアニメーション後の色に設定"""
+        self.led_animation.set_after_animation_color(self.current_color)
+        self.after_color_preview.setColor(self.current_color)
+        self.logger.info(f"現在の色をアニメーション後の色に設定しました: R={self.current_color.red()}, G={self.current_color.green()}, B={self.current_color.blue()}")
     
     # アニメーション関連メソッド
     def start_animation(self, animation_type):
