@@ -4,9 +4,9 @@
 a = Analysis(
     ['sirius3_led_controller.py'],
     pathex=[],
-    binaries=[('/System/Library/Frameworks/CoreBluetooth.framework', 'CoreBluetooth.framework')],
-    datas=[],
-    hiddenimports=['bleak', 'pyaudio', 'numpy'],
+    binaries=[],
+    datas=[('sirius3_led_animations.py', '.')],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,10 +35,11 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['icon.ico'],
 )
 app = BUNDLE(
     exe,
     name='Sirius3 LED Controller.app',
-    icon=None,
-    bundle_identifier='com.nlab.sirius3ledcontroller',
+    icon='icon.ico',
+    bundle_identifier=None,
 )
