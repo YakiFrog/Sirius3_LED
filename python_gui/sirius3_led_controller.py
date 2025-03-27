@@ -1176,6 +1176,9 @@ class MainWindow(QMainWindow):
         
         self.audio_mode = False
         
+        # アニメーション切り替え処理のフラグを初期化
+        self._animation_transition_in_progress = False
+        
         # オーディオプロセッサの初期化
         self.audio_processor = AudioProcessor()
         self.audio_processor.color_changed.connect(self.update_audio_color)
@@ -1754,7 +1757,12 @@ class MainWindow(QMainWindow):
             self.ble_controller.set_audio_mode(False)
             self.audio_mode = False
         
-        # アニメーション確認処理を改善
+        # 処理中フラグを設定（二重実行防止）
+        if hasattr(self, '_animation_transition_in_progress') and self._animation_transition_in_progress:
+            self.logger.warning("アニメーション切り替え処理中です。しばらくお待ちください。")
+            return
+        
+        # アニメーション実行中の確認と停止
         if self.led_animation.running:
             # 同じアニメーションが実行中の場合は停止するだけ
             if self.led_animation.current_animation == animation_type:
@@ -1762,12 +1770,42 @@ class MainWindow(QMainWindow):
                 self.stop_animation()
                 return
             
-            # 異なるアニメーションが実行中の場合は一度停止してから新しいアニメーションを開始
-            self.logger.info(f"別のアニメーション({self.led_animation.current_animation})が実行中のため停止してから{animation_type}を開始します")
-            self.led_animation.stop_animation()
-            # 少し待機して安定させる（非同期実行のため）
-            QApplication.processEvents()
+            # 処理中フラグを設定
+            self._animation_transition_in_progress = True
             
+            # 異なるアニメーションが実行中の場合は一度停止してから新しいアニメーション開始
+            self.logger.info(f"別のアニメーション({self.led_animation.current_animation})が実行中のため停止します")
+            prev_animation = self.led_animation.current_animation
+            
+            # アニメーション停止
+            self.led_animation.stop_animation()
+            
+            # UIを更新（停止状態に）
+            self.reset_animation_buttons()
+            self.animation_status.setText("切り替え中...")
+            
+            # アニメーション切り替え用タイマー設定
+            # タイマーを使って十分な間隔を空ける（安全マージン）
+            QTimer.singleShot(500, lambda: self._delayed_start_animation(animation_type, prev_animation))
+            return
+            
+        # 通常のアニメーション開始（既存の処理）
+        self._start_animation_impl(animation_type)
+    
+    def _delayed_start_animation(self, animation_type, prev_animation):
+        """アニメーション停止後の遅延付き開始処理"""
+        # コマンドキューの処理を待つ
+        self.logger.info(f"{prev_animation}アニメーションの停止完了を待機しています...")
+        
+        # ここで処理中フラグをクリア
+        self._animation_transition_in_progress = False
+        
+        # 新しいアニメーションを開始
+        self.logger.info(f"新しいアニメーション({animation_type})を開始します")
+        self._start_animation_impl(animation_type)
+    
+    def _start_animation_impl(self, animation_type):
+        """アニメーション開始の実装部分"""
         # アニメーション開始前にUIを更新
         self.reset_animation_buttons()
         self.stop_animation_btn.setEnabled(True)
@@ -1801,23 +1839,20 @@ class MainWindow(QMainWindow):
     
     def stop_animation(self):
         """実行中のアニメーションを停止する"""
+        # 処理中フラグをクリア（アニメーション停止は常に可能にする）
+        self._animation_transition_in_progress = False
+        
+        # アニメーションステータスを更新
+        self.animation_status.setText("停止中...")
+        
+        # アニメーション停止
         self.led_animation.stop_animation()
+        
+        # UI更新
         self.stop_animation_btn.setEnabled(False)
         self.reset_animation_buttons()
         self.animation_status.setText("なし")
-    
-    def reset_animation_buttons(self):
-        """全てのアニメーションボタンのスタイルをリセット"""
-        self.left_turn_btn.setStyleSheet("")
-        self.right_turn_btn.setStyleSheet("")
-        self.hazard_btn.setStyleSheet("")
-        self.lane_left_btn.setStyleSheet("")
-        self.lane_right_btn.setStyleSheet("")
-        self.thank_you_btn.setStyleSheet("")
-        self.emergency_btn.setStyleSheet("background-color: #ff6b6b;")
-        self.forward_btn.setStyleSheet("")
-        self.reverse_btn.setStyleSheet("")
-    
+        
     def on_animation_started(self, animation_type):
         """アニメーション開始時のコールバック"""
         # 日本語の表示名に変換
@@ -2438,6 +2473,29 @@ class MainWindow(QMainWindow):
         # タスクがない場合（既に両方接続されている場合など）
         if not connect_tasks:
             on_all_connect_done()
+
+    def reset_animation_buttons(self):
+        """全てのアニメーションボタンのスタイルをリセット"""
+        if hasattr(self, 'left_turn_btn'):
+            self.left_turn_btn.setStyleSheet("")
+        if hasattr(self, 'right_turn_btn'):
+            self.right_turn_btn.setStyleSheet("")
+        if hasattr(self, 'hazard_btn'):
+            self.hazard_btn.setStyleSheet("")
+        if hasattr(self, 'lane_left_btn'):
+            self.lane_left_btn.setStyleSheet("")
+        if hasattr(self, 'lane_right_btn'):
+            self.lane_right_btn.setStyleSheet("")
+        if hasattr(self, 'thank_you_btn'):
+            self.thank_you_btn.setStyleSheet("")
+        if hasattr(self, 'emergency_btn') and hasattr(self, 'emergency_btn.setStyleSheet'):
+            self.emergency_btn.setStyleSheet("background-color: #ff6b6b;")
+        if hasattr(self, 'forward_btn'):
+            self.forward_btn.setStyleSheet("")
+        if hasattr(self, 'reverse_btn'):
+            self.reverse_btn.setStyleSheet("")
+        
+        self.logger.debug("アニメーションボタンのスタイルをリセットしました")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
