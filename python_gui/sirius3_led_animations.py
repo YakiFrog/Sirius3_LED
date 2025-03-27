@@ -85,9 +85,22 @@ class LEDAnimation:
     
     def start_animation(self, animation_type, **kwargs):
         """指定されたアニメーションを開始する"""
+        # アニメーションがすでに実行中の場合は先に停止する
         if self.running:
+            self.logger.info(f"新しいアニメーション({animation_type})のため、実行中のアニメーションを停止します")
+            # 現在のアニメーション名を一時保存
+            previous_animation = self.current_animation
+            # 停止処理
             self.stop_animation()
-        
+            # 確実に停止処理が完了するまで少し待機
+            time.sleep(0.1)
+            # 停止していない場合は強制的にフラグをリセット
+            if self.running:
+                self.logger.warning("前のアニメーションの停止処理が完了していないため強制的に停止します")
+                self.running = False
+                self.stop_event.set()
+    
+        # 新しいアニメーションの開始
         self.running = True
         self.current_animation = animation_type
         self.stop_event.clear()

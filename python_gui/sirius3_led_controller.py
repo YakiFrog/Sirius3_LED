@@ -1209,7 +1209,8 @@ class MainWindow(QMainWindow):
         # コンソールハンドラー
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.DEBUG)
-        formatter = logging.Formatter('%(asctime)s - %(levellevel)s - %(message)s')
+        # ここの "levellevel" を "levelname" に修正
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         console_handler.setFormatter(formatter)
         self.logger.addHandler(console_handler)
         
@@ -1753,14 +1754,23 @@ class MainWindow(QMainWindow):
             self.ble_controller.set_audio_mode(False)
             self.audio_mode = False
         
-        # アニメーション開始
-        self.led_animation.start_animation(animation_type)
-        
-        # 停止ボタンを有効化
-        self.stop_animation_btn.setEnabled(True)
-        
-        # ボタンのアクティブ状態を視覚的に示す
+        # アニメーション確認処理を改善
+        if self.led_animation.running:
+            # 同じアニメーションが実行中の場合は停止するだけ
+            if self.led_animation.current_animation == animation_type:
+                self.logger.info(f"同じアニメーション({animation_type})が実行中のため停止します")
+                self.stop_animation()
+                return
+            
+            # 異なるアニメーションが実行中の場合は一度停止してから新しいアニメーションを開始
+            self.logger.info(f"別のアニメーション({self.led_animation.current_animation})が実行中のため停止してから{animation_type}を開始します")
+            self.led_animation.stop_animation()
+            # 少し待機して安定させる（非同期実行のため）
+            QApplication.processEvents()
+            
+        # アニメーション開始前にUIを更新
         self.reset_animation_buttons()
+        self.stop_animation_btn.setEnabled(True)
         
         # クリックされたボタンをハイライト
         if animation_type == "left_turn":
@@ -1781,6 +1791,13 @@ class MainWindow(QMainWindow):
             self.forward_btn.setStyleSheet("background-color: #5bc0de; font-weight: bold;")
         elif animation_type == "reverse":
             self.reverse_btn.setStyleSheet("background-color: #5bc0de; font-weight: bold;")
+        
+        # アニメーション開始
+        if not self.led_animation.start_animation(animation_type):
+            self.logger.error(f"アニメーション({animation_type})の開始に失敗しました")
+            self.reset_animation_buttons()
+            self.stop_animation_btn.setEnabled(False)
+            return
     
     def stop_animation(self):
         """実行中のアニメーションを停止する"""
@@ -1889,7 +1906,7 @@ class MainWindow(QMainWindow):
     def update_connection_status(self, device_key, connected):
         """接続状態の表示を更新"""
         # 元のコードを実行
-        if device_key == "LEFT":
+        if (device_key == "LEFT"):
             btn = self.left_connect_btn
             label = self.left_status_label
             apply_btn = self.apply_left_btn
